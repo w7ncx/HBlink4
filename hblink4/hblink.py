@@ -47,7 +47,8 @@ try:
     from .config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from .protocol import (
         parse_dmr_packet, is_dmr_terminator, validate_packet_length,
-        extract_packet_command, get_call_type_name, format_id_display
+        extract_packet_command, get_call_type_name, format_id_display,
+        get_slot_name
     )
     from .models import (
         OutboundConnectionConfig, StreamState, OutboundState, RepeaterState
@@ -68,7 +69,8 @@ except ImportError:
     from config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from protocol import (
         parse_dmr_packet, is_dmr_terminator, validate_packet_length,
-        extract_packet_command, get_call_type_name, format_id_display
+        extract_packet_command, get_call_type_name, format_id_display,
+        get_slot_name
     )
     from models import (
         OutboundConnectionConfig, StreamState, OutboundState, RepeaterState
@@ -730,27 +732,55 @@ class HBProtocol(asyncio.DatagramProtocol):
                 'terminator'
             )
         
-        # Find local repeaters that should receive this traffic
+        # Find local repeaters that should receive this traffic.
+        # Source is an outbound connection → (_slot, _dst_id, _rf_src) already
+        # network-side. Per-target, apply outbound_map (net → target-local) and
+        # optional reverse subscriber NAT, plus data-sync payload blanking.
+        _payload_blank = (_frame_type == 2)
         forwarded_count = 0
         for local_repeater_id, local_repeater in self._repeaters.items():
             # Only forward to connected repeaters
             if local_repeater.connection_state != 'connected':
                 continue
-            
-            # Check if this local repeater allows this TG on this slot
+
+            # ACL on network vocabulary
             if not self._check_outbound_routing(local_repeater_id, _slot, _dst_id):
                 continue
-            
-            # Check slot availability (don't hijack active streams)
-            if self._is_slot_busy(local_repeater_id, _slot, _stream_id, _rf_src, _dst_id):
+
+            # Translate net → target-local for slot busy / packet rewrite
+            if local_repeater.outbound_map:
+                t_local = local_repeater.outbound_map.get((_slot, _dst_id))
+                if t_local is not None:
+                    out_slot, out_dst = t_local
+                else:
+                    out_slot, out_dst = _slot, _dst_id
+            else:
+                out_slot, out_dst = _slot, _dst_id
+
+            # Check slot availability (don't hijack active streams) on target-local slot
+            if self._is_slot_busy(local_repeater_id, out_slot, _stream_id, _rf_src, out_dst):
                 continue
-            
-            # Forward the packet unchanged (repeater_id stays as remote source)
-            self._send_packet(data, local_repeater.sockaddr)
+
+            # Rewrite if any translation is in play or if this is a data-sync frame
+            if (not _payload_blank and (out_slot, out_dst) == (_slot, _dst_id)):
+                self._send_packet(data, local_repeater.sockaddr)
+            else:
+                buf = bytearray(data)
+                if out_dst != _dst_id:
+                    buf[8:11] = out_dst
+                current_slot_bit = 2 if (buf[15] & 0x80) else 1
+                if out_slot != current_slot_bit:
+                    if out_slot == 2:
+                        buf[15] |= 0x80
+                    else:
+                        buf[15] &= 0x7F
+                if _payload_blank:
+                    buf[20:53] = b'\x00' * 33
+                self._send_packet(bytes(buf), local_repeater.sockaddr)
             forwarded_count += 1
-            
-            # Track assumed stream state on local repeater
-            self._update_assumed_stream(local_repeater, _slot, _rf_src, _dst_id,
+
+            # Track assumed stream state on local repeater using target-local values
+            self._update_assumed_stream(local_repeater, out_slot, _rf_src, out_dst,
                                        _stream_id, _is_terminator, remote_repeater_id)
         
         # Log forwarding at DEBUG level
@@ -1223,14 +1253,17 @@ class HBProtocol(asyncio.DatagramProtocol):
     def _check_inbound_routing(self, repeater_id: bytes, slot: int, dst_id: bytes) -> bool:
         """
         Check if a repeater is allowed to send traffic on this TS/TGID.
-        
+
         Uses cached TG bytes sets in RepeaterState for O(1) lookup with no conversion.
-        
+        If the repeater has an inbound translation map, the (slot,dst_id) are
+        translated to network-side values before the ACL check — subscription
+        sets are always kept in network-side vocabulary.
+
         Args:
             repeater_id: Repeater ID to check
-            slot: Timeslot (1 or 2)
-            dst_id: Destination TGID as 3-byte DMR format
-            
+            slot: Timeslot (1 or 2) — as received from the repeater (local)
+            dst_id: Destination TGID as 3-byte DMR format — as received (local)
+
         Returns:
             True if traffic is allowed, False otherwise
         """
@@ -1238,7 +1271,14 @@ class HBProtocol(asyncio.DatagramProtocol):
         repeater = self._repeaters.get(repeater_id)
         if not repeater:
             return False
-        
+
+        # Translate local→network before ACL so subscription set (network-side)
+        # and the packet's addressing line up.
+        if repeater.inbound_map:
+            translated = repeater.inbound_map.get((slot, dst_id))
+            if translated is not None:
+                slot, dst_id = translated
+
         # Get slot-specific talkgroup set from repeater state
         allowed_tgids = repeater.slot1_talkgroups if slot == 1 else repeater.slot2_talkgroups
         
@@ -1583,9 +1623,19 @@ class HBProtocol(asyncio.DatagramProtocol):
             
             return False
         
+        # Translate source-local → network once for target calculation.
+        # Source-side StreamState continues to store LOCAL values so hang-time
+        # and contention comparisons stay in the source's vocabulary.
+        if repeater.inbound_map:
+            net_slot, net_dst_id = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+        else:
+            net_slot, net_dst_id = slot, dst_id
+
         # Calculate forwarding targets (once per stream, not per packet!)
+        # Targets evaluated against NETWORK addressing so every repeater's
+        # outbound_map lookup speaks the same vocabulary.
         target_repeaters = self._calculate_stream_targets(
-            repeater.repeater_id, slot, dst_id, stream_id, rf_src
+            repeater.repeater_id, net_slot, net_dst_id, stream_id, rf_src
         )
         
         # No active stream, start a new one with routing cache
@@ -1945,12 +1995,167 @@ class HBProtocol(asyncio.DatagramProtocol):
             'match_reason': match_reason
         })
 
+    def _parse_rpto_translation_entry(self, net_slot: int, entry_str: str
+                                      ) -> Tuple[Set[bytes], List[Tuple[int, bytes, int, bytes, int]]]:
+        """
+        Parse a single comma-separated RPTO entry.
+
+        Entry syntax: net_tgid_spec[:local_slot[:local_tgid]]
+          net_tgid_spec: N | N-M (range) | N* (prefix; not yet supported) | *
+          local_slot:    1 | 2 | *  (* = same as net_slot)
+          local_tgid:    N | *      (* = same as matched net_tgid)
+
+        Returns:
+            (subscription_tgids, translations)
+            subscription_tgids: set of 3-byte net tgids to add to this slot's TG
+              subscription set (drives ACL on the network-side vocabulary).
+            translations: list of (net_slot, net_tgid_bytes, local_slot,
+              local_tgid_bytes, specificity). Empty if the entry has no remap
+              clause (pure subscription). Specificity: exact=3, range=2, wildcard=0.
+        """
+        parts = [p.strip() for p in entry_str.split(':')]
+        net_spec = parts[0]
+        has_remap = len(parts) > 1
+
+        # --- parse net_tgid_spec ---
+        matched_tgids: List[int] = []
+        specificity = 0
+
+        if not net_spec:
+            raise ValueError('empty net_tgid spec')
+
+        if net_spec == '*':
+            if has_remap:
+                raise ValueError('wildcards are not supported on the net side — '
+                                 'use a specific TGID or a range (e.g., 3000-3200)')
+            return (set(), [])
+
+        if net_spec.endswith('*'):
+            raise ValueError(f'wildcards are not supported on the net side '
+                             f'("{net_spec}") — use a specific TGID or a range '
+                             f'(e.g., 9000-9999)')
+
+        if '-' in net_spec:
+            try:
+                a, b = net_spec.split('-', 1)
+                start, end = int(a), int(b)
+            except ValueError:
+                raise ValueError(f'invalid range: "{net_spec}"')
+            if end < start:
+                raise ValueError(f'invalid range (end<start): "{net_spec}"')
+            if end - start + 1 > 10000:
+                raise ValueError(f'range too large to expand: "{net_spec}"')
+            matched_tgids = list(range(start, end + 1))
+            specificity = 2
+        else:
+            try:
+                matched_tgids = [int(net_spec)]
+            except ValueError:
+                raise ValueError(f'invalid tgid: "{net_spec}"')
+            specificity = 3
+
+        subscription_tgids = {t.to_bytes(3, 'big') for t in matched_tgids}
+
+        if not has_remap:
+            return (subscription_tgids, [])
+
+        # --- parse remap part ---
+        local_slot_spec = parts[1] if len(parts) >= 2 and parts[1] != '' else '*'
+        local_tgid_spec = parts[2] if len(parts) >= 3 and parts[2] != '' else '*'
+
+        if local_slot_spec == '*':
+            local_slot = net_slot
+        else:
+            try:
+                local_slot = int(local_slot_spec)
+            except ValueError:
+                raise ValueError(f'invalid local_slot: "{local_slot_spec}"')
+            if local_slot not in (1, 2):
+                raise ValueError(f'local_slot must be 1 or 2, got {local_slot}')
+
+        if local_tgid_spec == '*':
+            local_tgid_int: Optional[int] = None  # preserve matched net tgid
+        else:
+            try:
+                local_tgid_int = int(local_tgid_spec)
+            except ValueError:
+                raise ValueError(f'invalid local_tgid: "{local_tgid_spec}"')
+
+        translations: List[Tuple[int, bytes, int, bytes, int]] = []
+        for nt in matched_tgids:
+            lt = nt if local_tgid_int is None else local_tgid_int
+            translations.append((
+                net_slot,
+                nt.to_bytes(3, 'big'),
+                local_slot,
+                lt.to_bytes(3, 'big'),
+                specificity,
+            ))
+        return (subscription_tgids, translations)
+
+    def _build_translation_maps(self, repeater_id: bytes,
+                                translations: List[Tuple[int, bytes, int, bytes, int]]
+                                ) -> Tuple[Dict[Tuple[int, bytes], Tuple[int, bytes]],
+                                           Dict[Tuple[int, bytes], Tuple[int, bytes]]]:
+        """
+        Build inbound/outbound translation maps from a list of translation tuples.
+        Most-specific rule wins on collision; less-specific conflicts are dropped
+        with a warning. inbound and outbound are inverses.
+        """
+        # Sort by specificity DESC so the first seen key wins (most specific).
+        entries = sorted(translations, key=lambda t: -t[4])
+
+        inbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
+        outbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
+        # Remember which (specificity) claimed each key for collision logging.
+        inbound_spec: Dict[Tuple[int, bytes], int] = {}
+        outbound_spec: Dict[Tuple[int, bytes], int] = {}
+
+        for net_slot, net_tgid, local_slot, local_tgid, spec in entries:
+            net_key = (net_slot, net_tgid)
+            local_key = (local_slot, local_tgid)
+
+            if local_key in inbound:
+                LOGGER.warning(
+                    f'⚠️  Translation collision on repeater {rid_to_int(repeater_id)}: '
+                    f'local {get_slot_name(local_key[0])}/TG{int.from_bytes(local_key[1], "big")} '
+                    f'already mapped (specificity {inbound_spec[local_key]}); '
+                    f'dropping less-specific rule → net {get_slot_name(net_slot)}/'
+                    f'TG{int.from_bytes(net_tgid, "big")} (specificity {spec})'
+                )
+                continue
+            if net_key in outbound:
+                LOGGER.warning(
+                    f'⚠️  Translation collision on repeater {rid_to_int(repeater_id)}: '
+                    f'net {get_slot_name(net_key[0])}/TG{int.from_bytes(net_key[1], "big")} '
+                    f'already mapped (specificity {outbound_spec[net_key]}); '
+                    f'dropping less-specific rule → local {get_slot_name(local_slot)}/'
+                    f'TG{int.from_bytes(local_tgid, "big")} (specificity {spec})'
+                )
+                continue
+
+            inbound[local_key] = net_key
+            outbound[net_key] = local_key
+            inbound_spec[local_key] = spec
+            outbound_spec[net_key] = spec
+
+        return (inbound, outbound)
+
     def _handle_options(self, repeater_id: bytes, data: bytes, addr: PeerAddress) -> None:
         """
         Handle RPTO message - parse TG options and update repeater's allowed TGs.
         Only TGs that are in the original config are accepted (config has final say).
-        
-        Format: TS1=tg1,tg2;TS2=tg3,tg4
+
+        Format (backward compatible): TS1=tg1,tg2;TS2=tg3,tg4
+
+        Translation syntax (trusted repeaters only): each comma-separated entry
+        may be `net_tgid[:local_slot[:local_tgid]]`. See
+        _parse_rpto_translation_entry for the full grammar.
+
+        Outbound rf_src override (trusted repeaters only):
+          SRC=9990001
+        Every group-voice packet forwarded out of this repeater will have its
+        rf_src rewritten to this ID. One-way, group only.
         """
         repeater = self._validate_repeater(repeater_id, addr)
         if not repeater:
@@ -1972,23 +2177,58 @@ class HBProtocol(asyncio.DatagramProtocol):
             config_ts1 = {tg.to_bytes(3, 'big') for tg in repeater_config.slot1_talkgroups} if repeater_config.slot1_talkgroups is not None else None
             config_ts2 = {tg.to_bytes(3, 'big') for tg in repeater_config.slot2_talkgroups} if repeater_config.slot2_talkgroups is not None else None
             
-            # Parse RPTO format: "TS1=1,2,3;TS2=4,5,6;..."
-            requested_ts1 = set()
-            requested_ts2 = set()
-            
+            # Parse RPTO: TS1=.../TS2=... can hold translation syntax per entry.
+            # SRC= declares a single rf_src override applied to every group-voice
+            # packet forwarded out of this repeater (one-way).
+            requested_ts1: Set[bytes] = set()
+            requested_ts2: Set[bytes] = set()
+            translations: List[Tuple[int, bytes, int, bytes, int]] = []
+            tx_src_override: Optional[bytes] = None
+            saw_translation_syntax = False
+
             for part in options_str.split(';'):
                 part = part.strip()
                 if not part or '=' not in part:
                     continue
                 key, value = part.split('=', 1)
                 key = key.strip().upper()
-                
-                if key == 'TS1' and value:
-                    requested_ts1 = {int(tg.strip()).to_bytes(3, 'big') for tg in value.split(',') 
-                                     if tg.strip().isdigit()}
-                elif key == 'TS2' and value:
-                    requested_ts2 = {int(tg.strip()).to_bytes(3, 'big') for tg in value.split(',') 
-                                     if tg.strip().isdigit()}
+                value = value.strip()
+
+                if key in ('TS1', 'TS2'):
+                    net_slot = 1 if key == 'TS1' else 2
+                    target_set = requested_ts1 if net_slot == 1 else requested_ts2
+                    if not value or value == '*':
+                        continue
+                    for entry in value.split(','):
+                        entry = entry.strip()
+                        if not entry:
+                            continue
+                        try:
+                            subs, xlates = self._parse_rpto_translation_entry(net_slot, entry)
+                        except ValueError as e:
+                            LOGGER.warning(
+                                f'⚠️  RPTO parse error on {key}="{entry}" from repeater '
+                                f'{rid_to_int(repeater_id)}: {e}'
+                            )
+                            continue
+                        target_set.update(subs)
+                        if xlates:
+                            saw_translation_syntax = True
+                            translations.extend(xlates)
+                elif key == 'SRC':
+                    saw_translation_syntax = True
+                    if not value:
+                        continue
+                    try:
+                        src_id_int = int(value)
+                        if not 0 < src_id_int < 0x1000000:
+                            raise ValueError('out of 24-bit range')
+                        tx_src_override = src_id_int.to_bytes(3, 'big')
+                    except ValueError as e:
+                        LOGGER.warning(
+                            f'⚠️  RPTO SRC parse error from repeater '
+                            f'{rid_to_int(repeater_id)}: "{value}" ({e})'
+                        )
             
             # Check if this repeater is trusted
             if repeater_config.trust:
@@ -2048,10 +2288,61 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater.slot1_talkgroups = final_ts1
             repeater.slot2_talkgroups = final_ts2
             repeater.rpto_received = True  # Mark that RPTO was received
-            
+
+            # Build translation maps. Only trusted repeaters may declare remaps
+            # or rf_src override; untrusted repeaters get translation syntax
+            # silently ignored (their TG subscription is still honored).
+            if saw_translation_syntax and not repeater_config.trust:
+                LOGGER.warning(
+                    f'⚠️  Repeater {rid_to_int(repeater_id)} sent translation syntax '
+                    f'but is not trusted — translation rules ignored'
+                )
+                new_inbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
+                new_outbound: Dict[Tuple[int, bytes], Tuple[int, bytes]] = {}
+                new_tx_src_override: Optional[bytes] = None
+            elif repeater_config.trust:
+                new_inbound, new_outbound = self._build_translation_maps(repeater_id, translations)
+                new_tx_src_override = tx_src_override
+            else:
+                new_inbound = {}
+                new_outbound = {}
+                new_tx_src_override = None
+
+            # Warn if RPTO arrives mid-stream; apply anyway (asyncio is single
+            # threaded and the active stream will flush in seconds).
+            active_stream = False
+            for s in (1, 2):
+                st = repeater.get_slot_stream(s)
+                if st and not st.ended:
+                    active_stream = True
+                    break
+            if active_stream and (new_inbound or new_outbound
+                                  or repeater.inbound_map or repeater.outbound_map):
+                LOGGER.warning(
+                    f'⚠️  RPTO received during active stream on repeater '
+                    f'{rid_to_int(repeater_id)} — translation rules updated, '
+                    f'takes effect on next stream'
+                )
+
+            repeater.inbound_map = new_inbound
+            repeater.outbound_map = new_outbound
+            repeater.tx_src_override = new_tx_src_override
+
             # Log final TG lists (handle None = allow all)
             LOGGER.info(f'  → TS1 TGs: {self._format_tg_display(final_ts1)}')
             LOGGER.info(f'  → TS2 TGs: {self._format_tg_display(final_ts2)}')
+            if new_inbound:
+                LOGGER.info(f'  → Translation rules: {len(new_inbound)} active')
+                for (lslot, ltgid), (nslot, ntgid) in sorted(new_inbound.items()):
+                    LOGGER.info(
+                        f'      local {get_slot_name(lslot)}/TG{int.from_bytes(ltgid, "big")} '
+                        f'↔ net {get_slot_name(nslot)}/TG{int.from_bytes(ntgid, "big")}'
+                    )
+            if new_tx_src_override is not None:
+                LOGGER.info(
+                    f'  → Outbound rf_src override: {int.from_bytes(new_tx_src_override, "big")} '
+                    f'(group voice only)'
+                )
             
             # Emit event to update dashboard in real-time
             self._events.emit('repeater_options_updated', {
@@ -2162,27 +2453,41 @@ class HBProtocol(asyncio.DatagramProtocol):
         """
         target_set = set()
         
-        # Calculate local repeater targets
+        # Calculate local repeater targets.
+        # `slot`/`dst_id` are network-side values — each target may remap them
+        # to its own local slot/tgid before landing on the air.
         for target_repeater_id, target_repeater in self._repeaters.items():
             # Skip source repeater
             if target_repeater_id == source_repeater_id:
                 continue
-            
+
             # Only forward to connected repeaters
             if target_repeater.connection_state != 'connected':
                 continue
-            
-            # Check outbound routing (TG allowed on this repeater/slot)
+
+            # Check outbound routing (TG allowed on this repeater/slot, network vocab)
             if not self._check_outbound_routing(target_repeater_id, slot, dst_id):
                 continue
-            
+
+            # Resolve the target's LOCAL slot/tgid for busy/hang-time checks.
+            # A translated repeater's physical slot can differ from the net slot,
+            # so we must check the slot the packet will actually occupy on air.
+            if target_repeater.outbound_map:
+                local = target_repeater.outbound_map.get((slot, dst_id))
+                if local is not None:
+                    check_slot, check_dst = local
+                else:
+                    check_slot, check_dst = slot, dst_id
+            else:
+                check_slot, check_dst = slot, dst_id
+
             # Check slot availability AT STREAM START (not per-packet!)
             # If busy now, exclude from this transmission entirely
-            if self._is_slot_busy(target_repeater_id, slot, stream_id, rf_src, dst_id):
+            if self._is_slot_busy(target_repeater_id, check_slot, stream_id, rf_src, check_dst):
                 LOGGER.debug(f'Target repeater {int.from_bytes(target_repeater_id, "big")} '
-                           f'TS{slot} busy at stream start, excluded from this transmission')
+                           f'TS{check_slot} busy at stream start, excluded from this transmission')
                 continue
-            
+
             # Passed all checks - will receive entire transmission
             target_set.add(target_repeater_id)
         
@@ -2230,47 +2535,110 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         return target_set
     
-    def _forward_stream(self, data: bytes, source_repeater_id: bytes, slot: int, 
+    def _forward_stream(self, data: bytes, source_repeater_id: bytes, slot: int,
                        rf_src: bytes, dst_id: bytes, stream_id: bytes) -> None:
         """
         Forward DMR stream to target repeaters using cached routing.
-        
+
         Targets are calculated ONCE at stream start. No per-packet checks needed!
-        This provides massive performance improvement and better user experience.
-        
+
+        When translation is in play we may rewrite:
+          - bytes  5-7  rf_src (subscriber NAT, if configured on source)
+          - bytes  8-10 dst_id (target-local or network, per target's outbound_map)
+          - byte   15   slot bit (follows translated slot)
+          - bytes 20-52 payload: on data-sync frames (frame_type==2: LC header /
+            terminator / CSBK) we ZERO the 33-byte payload so MMDVMHost's BPTC
+            decode fails and it falls back to the DMRD header values we just
+            rewrote. Voice frames (frame_type 0/1) keep the AMBE vocoder bits
+            intact — MMDVMHost regenerates sync/EMB/slot-type/LC overhead.
+
         Args:
             data: Complete DMRD packet (20-byte HBP header + 33-byte DMR data)
             source_repeater_id: Repeater ID of originating repeater
-            slot: Timeslot (1 or 2)
-            rf_src: RF source subscriber ID (3 bytes)
-            dst_id: Destination TGID (3 bytes)  
+            slot: Source-local timeslot (1 or 2)
+            rf_src: RF source subscriber ID (3 bytes) — source-local
+            dst_id: Destination TGID (3 bytes) — source-local
             stream_id: Unique stream identifier (4 bytes)
         """
         # Get source repeater's stream (which has the routing cache)
         source_repeater = self._repeaters.get(source_repeater_id)
         if not source_repeater:
             return
-        
+
         source_stream = source_repeater.get_slot_stream(slot)
         if not source_stream or source_stream.stream_id != stream_id:
             # This shouldn't happen, but safety check
             LOGGER.warning(f'Forwarding called but no matching stream found')
             return
-        
+
+        # Translate source-local → network ONCE. All target lookups use network
+        # keys (outbound_map is keyed on network values).
+        if source_repeater.inbound_map:
+            net_slot, net_dst_id = source_repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+        else:
+            net_slot, net_dst_id = slot, dst_id
+
+        # Outbound rf_src override: replace EVERY rf_src from this repeater with
+        # a single network-side ID. Group voice only — call_type bit is bit 6 of
+        # byte 15 (0 = group, 1 = private/unit). Unit calls are rejected upstream
+        # today, but gate here too so the override stays scoped to group voice.
+        call_type_bit = (data[15] & 0x40) >> 6
+        if source_repeater.tx_src_override is not None and call_type_bit == 0:
+            net_rf_src = source_repeater.tx_src_override
+        else:
+            net_rf_src = rf_src
+
         # Use cached target list (calculated once on stream start!)
         if not source_stream.routing_cached or source_stream.target_repeaters is None:
             # Safety fallback (shouldn't happen)
             LOGGER.warning(f'Stream routing not cached, recalculating')
             source_stream.target_repeaters = self._calculate_stream_targets(
-                source_repeater_id, slot, dst_id, stream_id, rf_src
+                source_repeater_id, net_slot, net_dst_id, stream_id, net_rf_src
             )
             source_stream.routing_cached = True
-        
-        # Check if this is a terminator packet
+
+        # Check if this is a terminator packet (use original data bits for check)
         _bits = data[15]
         _frame_type = (_bits & 0x30) >> 4
         is_terminator = self._is_dmr_terminator(data, _frame_type)
-        
+
+        # Pre-compute a shared "network-addressed" packet buffer when the source
+        # translated (or NATted). Targets then either send this as-is (no
+        # outbound_map) or clone+rewrite for their own local addressing.
+        source_translated = (net_slot, net_dst_id) != (slot, dst_id) or net_rf_src != rf_src
+        # Data-sync frames get payload blanked on every outgoing packet per spec.
+        payload_blank = (_frame_type == 2)
+
+        def build_target_packet(out_slot: int, out_dst: bytes, out_src: bytes,
+                                out_repeater_id: Optional[bytes]) -> bytes:
+            """Return a DMRD packet with the requested header fields + blanking."""
+            # Fast path: no rewrites needed at all.
+            if (not payload_blank
+                    and out_slot == slot
+                    and out_dst == dst_id
+                    and out_src == rf_src
+                    and out_repeater_id is None):
+                return data
+            buf = bytearray(data)
+            if out_src != rf_src:
+                buf[5:8] = out_src
+            if out_dst != dst_id:
+                buf[8:11] = out_dst
+            if out_repeater_id is not None:
+                buf[11:15] = out_repeater_id
+            # Slot bit: bit7 of byte 15 (0=TS1, 1=TS2).
+            current_slot_bit = 2 if (buf[15] & 0x80) else 1
+            if out_slot != current_slot_bit:
+                if out_slot == 2:
+                    buf[15] |= 0x80
+                else:
+                    buf[15] &= 0x7F
+            if payload_blank:
+                # Zero 33-byte DMR payload on data-sync frames so MMDVMHost
+                # falls back to our rewritten DMRD header.
+                buf[20:53] = b'\x00' * 33
+            return bytes(buf)
+
         # Simple loop through cached targets - no per-packet checks!
         for target in source_stream.target_repeaters:
             # Check if target is an outbound connection or local repeater
@@ -2280,36 +2648,47 @@ class HBProtocol(asyncio.DatagramProtocol):
                 outbound = self._outbounds.get(conn_name)
                 if not outbound or not outbound.authenticated:
                     continue  # Connection dropped mid-stream
-                
-                # CRITICAL: Rewrite repeater ID in DMRD packet (bytes 11-14)
-                # The remote server only knows us as our outbound radio_id, not the source repeater
-                # Must modify packet to replace source repeater ID with our outbound connection ID
-                modified_data = bytearray(data)
+
+                # Outbound server speaks network-side vocabulary — no local remap.
                 our_id_bytes = outbound.config.radio_id.to_bytes(4, 'big')
-                modified_data[11:15] = our_id_bytes
-                
-                # Forward modified packet to outbound server
-                outbound.transport.sendto(bytes(modified_data))
-                
+                packet = build_target_packet(net_slot, net_dst_id, net_rf_src, our_id_bytes)
+                outbound.transport.sendto(packet)
+
                 # Track assumed stream state on outbound slot (TDMA constraint)
                 # We must track what we're transmitting on each timeslot
-                self._update_assumed_stream_outbound(outbound, slot, rf_src, dst_id, 
+                self._update_assumed_stream_outbound(outbound, net_slot, net_rf_src, net_dst_id,
                                                     stream_id, is_terminator,
                                                     int.from_bytes(source_repeater_id, 'big'))
-                
+
             else:
                 # Target is a local repeater (bytes)
                 target_repeater_id = target
                 target_repeater = self._repeaters.get(target_repeater_id)
                 if not target_repeater:
                     continue  # Repeater disconnected mid-stream
-                
-                # Forward packet (no routing or slot checks - already approved!)
-                self._send_packet(data, target_repeater.sockaddr)
-                
-                # Track assumed stream state on target repeater
-                self._update_assumed_stream(target_repeater, slot, rf_src, dst_id, 
-                                           stream_id, is_terminator, 
+
+                # Per-target translation: network → target-local (if mapped).
+                if target_repeater.outbound_map:
+                    t_local = target_repeater.outbound_map.get((net_slot, net_dst_id))
+                    if t_local is not None:
+                        out_slot, out_dst = t_local
+                    else:
+                        out_slot, out_dst = net_slot, net_dst_id
+                else:
+                    out_slot, out_dst = net_slot, net_dst_id
+
+                # Fast path: no source translation, no target translation, no blanking
+                if (not payload_blank and not source_translated
+                        and (out_slot, out_dst) == (slot, dst_id)
+                        and net_rf_src == rf_src):
+                    self._send_packet(data, target_repeater.sockaddr)
+                else:
+                    packet = build_target_packet(out_slot, out_dst, net_rf_src, None)
+                    self._send_packet(packet, target_repeater.sockaddr)
+
+                # Track assumed stream state on target repeater using target-local values
+                self._update_assumed_stream(target_repeater, out_slot, net_rf_src, out_dst,
+                                           stream_id, is_terminator,
                                            int.from_bytes(source_repeater_id, 'big'))
     
     # ================================

@@ -79,7 +79,7 @@ A server will, at a minimum, need to track a repeater in the following states:
    - State: Must be in `connected` state
    - Server Response: `RPTACK` + `radio_id[4 bytes]`
    
-   **Options String Format:**
+   **Options String Format (basic):**
    ```
    TS1=tg1,tg2,tg3;TS2=tg4,tg5,tg6
    ```
@@ -100,6 +100,27 @@ A server will, at a minimum, need to track a repeater in the following states:
    
    If server config allows: TS1=[1,2,3,4,5] and TS2=[10,20,30]  
    Result: TS1=[1,2,3] (91 rejected), TS2=[10] (99 rejected)
+
+   **Extended Options Grammar (trusted repeaters only):**
+
+   HBlink4 accepts an extended form of each comma-separated entry to declare
+   slot/talkgroup translation, plus a top-level `SRC=` directive that rewrites
+   the rf_src on outgoing group-voice packets:
+
+   ```
+   entry          = net_tgid[:local_slot[:local_tgid]]
+   net_tgid       = N | N-M           (range; inclusive; ≤10,000 tgids)
+   local_slot     = 1 | 2 | *          (* = preserve network slot)
+   local_tgid     = N | *              (* = preserve matched network tgid)
+
+   SRC = radio_id                      (outbound rf_src override, group only)
+   ```
+
+   Wildcards are **not** permitted on the net-side (no `*`, no `N*` prefix).
+   Most-specific rule wins on collision (exact=3 > range=2). See
+   [dmrd_translation.md](dmrd_translation.md) for semantics, payload-blanking
+   behavior, and use cases, and [connecting_to_hblink4.md](connecting_to_hblink4.md)
+   for operator-facing `Options=` examples.
 
 6. **RPTCL (Repeater Close)**
    - Direction: Repeater → Server

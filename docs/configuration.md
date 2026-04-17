@@ -611,6 +611,48 @@ The `trust` flag allows designated repeaters to bypass talkgroup restrictions. T
 
 **Security Note:** Only assign `trust: true` to repeaters under your direct control. Trusted repeaters have unrestricted access to all talkgroups on the network.
 
+### DMRD Translation (RPTO Extensions)
+
+Trusted repeaters can declare **slot / talkgroup translation** and an optional **outbound rf_src override** via their RPTO (OPTIONS) packet. This lets a repeater's local addressing (what the radio user sees) differ from the network addressing (what the rest of the HBlink4 network sees).
+
+See **[dmrd_translation.md](dmrd_translation.md)** for full semantics, use cases, and operational notes. Quick summary below.
+
+**Extended RPTO grammar:**
+
+```
+TS1 = entry[,entry...]     ; subscription (and optional remap) on network TS1
+TS2 = entry[,entry...]     ; subscription (and optional remap) on network TS2
+SRC = radio_id             ; outbound rf_src override (group voice only)
+
+entry  = net_tgid_spec [ : local_slot [ : local_tgid ] ]
+net_tgid_spec = N         ; exact TGID (specificity 3)
+              | N-M       ; inclusive range, expanded at parse time (specificity 2)
+local_slot = 1 | 2 | *    ; * = preserve the network slot
+local_tgid = N | *        ; * = preserve the matched network TGID
+```
+
+Rules:
+
+- **Translation syntax is honored only when `trust: true`**. Non-trusted repeaters keep the legacy TG-subscription behavior; any remap is silently ignored with a warning.
+- An entry with **no colon** is a pure subscription (no translation), same as today.
+- Ranges (`N-M`) are expanded to individual map entries at parse time. Max 10,000 tgids per range.
+- **Wildcards are not supported on the network side** (no `*`, no `N*` prefix). Use a specific TGID or a range.
+- **Most-specific wins on collision**: exact (specificity 3) beats range (specificity 2). If two rules claim the same local or network key, the less-specific one is dropped with a warning.
+- **`SRC=` applies to group voice only**. Every outgoing packet from this repeater has its rf_src rewritten to this ID — one-way, no reverse translation needed (group destinations have no return address). Use when you want the rest of the network to see all traffic from a repeater as a single "site radio".
+
+**Quick examples:**
+
+```
+Options = "TS1=9"                          ; legacy: subscribe to net TS1/TG9
+Options = "TS1=9:2:9"                      ; net TS1/TG9 ↔ local TS2/TG9 (slot swap)
+Options = "TS1=9:2:32"                     ; net TS1/TG9 ↔ local TS2/TG32
+Options = "TS1=3000-3200:2:*"              ; range on TS1 delivered on local TS2, tgid preserved
+Options = "TS1=3000-3200:2:*,3120:1:3120"  ; same range EXCEPT TG3120 stays on local TS1
+Options = "TS1=9:2:32;SRC=9990001"         ; translation + outbound rf_src override
+```
+
+When an RPTO with translation arrives during an active stream, the new rules are applied immediately (a warning is logged); the in-flight stream will finish on its old rules within a few seconds.
+
 ### Pattern Matching Priority
 
 Patterns are evaluated in the order they appear in the configuration file. The first pattern that matches is used. Within each pattern, all match types (IDs, ID ranges, callsigns) are checked with OR logic.

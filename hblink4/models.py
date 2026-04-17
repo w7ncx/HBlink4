@@ -210,10 +210,30 @@ class RepeaterState:
     # Talkgroup access control (stored as bytes sets for hot path performance)
     # None = no restrictions (allow all), empty set = deny all, non-empty set = allow only those TGs
     # Format: Set of 3-byte TGIDs (e.g., {b'\x00\x00\x01', b'\x00\x00\x02'})
-    slot1_talkgroups: Optional[set] = None  # Set of 3-byte TGIDs 
+    slot1_talkgroups: Optional[set] = None  # Set of 3-byte TGIDs
     slot2_talkgroups: Optional[set] = None  # Set of 3-byte TGIDs
-    
+
     rpto_received: bool = False  # True if repeater sent RPTO to override config TGs
+
+    # DMRD translation maps (inverses of each other; empty = no translation).
+    # inbound_map:  local (slot,tgid) → network (slot,tgid) — applied when this
+    #               repeater SENDS us traffic, converting its local addressing
+    #               to network addressing so downstream ACL/routing speaks one
+    #               vocabulary.
+    # outbound_map: network (slot,tgid) → local (slot,tgid) — applied when we
+    #               SEND traffic to this repeater, rewriting into its local
+    #               addressing.
+    # Key/value: (slot_int_1_or_2, 3-byte tgid). Only populated for trusted
+    # repeaters that declared remap rules via RPTO.
+    inbound_map: Dict[Tuple[int, bytes], Tuple[int, bytes]] = field(default_factory=dict)
+    outbound_map: Dict[Tuple[int, bytes], Tuple[int, bytes]] = field(default_factory=dict)
+
+    # Outbound rf_src override: if set, every group-voice packet forwarded FROM
+    # this repeater has its rf_src (bytes 5-7) rewritten to this 3-byte value
+    # before going out to other local repeaters or outbound servers. One-way —
+    # the rest of the network sees all traffic from this repeater as originating
+    # from a single radio ID. None = no rewrite (default).
+    tx_src_override: Optional[bytes] = None
     
     # Active stream tracking per slot
     slot1_stream: Optional[StreamState] = None
