@@ -640,6 +640,8 @@ Rules:
 - **Most-specific wins on collision**: exact (specificity 3) beats range (specificity 2). If two rules claim the same local or network key, the less-specific one is dropped with a warning.
 - **`SRC=` applies to group voice only**. Every outgoing packet from this repeater has its rf_src rewritten to this ID — one-way, no reverse translation needed (group destinations have no return address). Use when you want the rest of the network to see all traffic from a repeater as a single "site radio".
 
+**Processing order (important):** translation is the **first** thing that runs on ingress and the **last** thing that runs on egress. ACL checks, hang time, contention detection, and routing all operate in **network vocabulary** — the translation layer normalizes the packet before those checks, and rewrites it back to the target's local vocabulary only as the final step before sending. When you configure `slot1_talkgroups` / `slot2_talkgroups` (or any rule that references a TS/TGID), think in network vocabulary. See [dmrd_translation.md § Processing order](dmrd_translation.md#processing-order) for the full step list.
+
 **Quick examples:**
 
 ```

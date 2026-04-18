@@ -87,6 +87,29 @@ At runtime:
 2. **Network → repeater (outbound)**. For every packet being forwarded **to** this repeater, HBlink4 looks up the packet's network `(slot, dst_id)` in `outbound_map`; if found, it rewrites the DMRD header to the local values so the repeater receives traffic on its local TS2/TG32.
 3. If a lookup misses (no entry for that key), the packet is left untranslated. This is the correct behavior for talkgroups that aren't part of any remap.
 
+### Processing order
+
+Translation is **the first thing that happens on ingress and the last thing that happens on egress**. Everything else — ACL, contention, hang time, stream tracking, routing — runs in network-side vocabulary. This keeps every downstream check speaking one language regardless of which repeater sent the packet or which repeater it's going to.
+
+**Ingress (packet arrives from a repeater), in order:**
+
+1. Packet enters with source-local `(slot, dst_id)`.
+2. **Translation applied**: `inbound_map` rewrites `(slot, dst_id)` to net values. No map = passthrough.
+3. Contention / hang time / hijack checks run against the source's stored stream state. *(StreamState still stores source-local values so same-user comparisons work regardless of translation.)*
+4. Inbound ACL checked against the repeater's subscription set (network vocabulary).
+5. Stream targets calculated; per-target `outbound_map` applied at packet-rewrite time.
+
+**Egress (packet leaves to a repeater), in order:**
+
+1. All routing/ACL/contention decisions have already been made in network vocabulary.
+2. Per-target outbound ACL checked (network vocabulary).
+3. Per-target slot-busy check runs against the *target-local* slot the packet will actually occupy, using the target's `outbound_map` to translate net → target-local first.
+4. **Translation applied**: `outbound_map` rewrites the DMRD header to the target's local `(slot, dst_id)`. No map = passthrough.
+5. Optional `rf_src` override (`SRC=`) from the source repeater rewrites bytes 5–7.
+6. Packet sent on the wire.
+
+The practical upshot: when you configure subscriptions, contention rules, or ACLs, think in **network vocabulary**. The translation layer makes sure whatever arrives (or leaves) lines up with what the rest of the server expects.
+
 ### Payload blanking
 
 DMR packets with `frame_type == 2` carry data-sync overhead: LC (link control) headers, terminators, and CSBKs. MMDVMHost reconstructs sync patterns, EMB, slot type, and LC overhead from the DMRD header *unless* its BPTC decode of the payload succeeds, in which case the decoded LC values override the header.

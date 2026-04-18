@@ -661,6 +661,7 @@ class EventReceiver:
                 state.repeaters[data['repeater_id']]['slot1_talkgroups'] = data.get('slot1_talkgroups', [])
                 state.repeaters[data['repeater_id']]['slot2_talkgroups'] = data.get('slot2_talkgroups', [])
                 state.repeaters[data['repeater_id']]['rpto_received'] = data.get('rpto_received', False)
+                state.repeaters[data['repeater_id']]['translations'] = data.get('translations', [])
                 logger.info(f"Repeater options updated via RPTO: {data['repeater_id']}")
         
         elif event_type == 'stream_start':
@@ -728,6 +729,10 @@ class EventReceiver:
                         'last_heard': event['timestamp'],
                         'active': True  # Mark as currently active
                     }
+                    # Only local repeater ingresses have translation state we can reference;
+                    # outbound-connection ingresses are remote and carry no local map.
+                    if connection_type != 'outbound':
+                        user_entry['source_repeater_id'] = data.get('repeater_id')
                     
                     if existing_idx is not None:
                         state.last_heard[existing_idx] = user_entry

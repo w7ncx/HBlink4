@@ -42,7 +42,8 @@ try:
     from .user_cache import UserCache
     from .utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
-        cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type
+        cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
+        fmt_ts_tg
     )
     from .config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from .protocol import (
@@ -64,7 +65,8 @@ except ImportError:
     from user_cache import UserCache
     from utils import (
         safe_decode_bytes, normalize_addr, rid_to_int, bytes_to_int,
-        cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type
+        cleanup_old_logs, setup_logging, PeerAddress, detect_connection_type,
+        fmt_ts_tg
     )
     from config import load_config as load_config_func, parse_outbound_connections as parse_outbound_func
     from protocol import (
@@ -186,6 +188,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         Prepare common repeater data dictionary for event emission.
         Centralizes the logic for converting repeater state to JSON-serializable format.
         """
+        translations_list = [
+            [lslot, int.from_bytes(ltgid, 'big'),
+             nslot, int.from_bytes(ntgid, 'big')]
+            for (lslot, ltgid), (nslot, ntgid) in sorted(repeater.inbound_map.items())
+        ]
         return {
             'repeater_id': rid_to_int(repeater_id),
             'callsign': repeater.get_callsign_str(),
@@ -200,6 +207,7 @@ class HBProtocol(asyncio.DatagramProtocol):
             'slot1_talkgroups': self._format_tg_json(repeater.slot1_talkgroups),
             'slot2_talkgroups': self._format_tg_json(repeater.slot2_talkgroups),
             'rpto_received': repeater.rpto_received,
+            'translations': translations_list,
             'last_ping': repeater.last_ping,
             'missed_pings': repeater.missed_pings
         }
@@ -711,8 +719,9 @@ class HBProtocol(asyncio.DatagramProtocol):
                 remote_repeater_id  # Originating repeater ID from remote server
             )
             
-            LOGGER.info(f'[{outbound_state.config.name}] RX stream started on TS{_slot}: '
-                       f'src={src_id}, dst={packet["dst_id_int"]}, from remote repeater {remote_repeater_id}')
+            ts_tg = fmt_ts_tg(_slot, _dst_id)
+            LOGGER.info(f'[{outbound_state.config.name}] RX stream started {ts_tg} '
+                       f'src={src_id} from remote repeater {remote_repeater_id}')
         else:
             # Update existing stream
             current_stream.last_seen = current_time
@@ -781,13 +790,14 @@ class HBProtocol(asyncio.DatagramProtocol):
 
             # Track assumed stream state on local repeater using target-local values
             self._update_assumed_stream(local_repeater, out_slot, _rf_src, out_dst,
-                                       _stream_id, _is_terminator, remote_repeater_id)
+                                       _stream_id, _is_terminator, remote_repeater_id,
+                                       net_slot=_slot, net_dst_id=_dst_id)
         
         # Log forwarding at DEBUG level
         if forwarded_count > 0:
+            ts_tg = fmt_ts_tg(_slot, _dst_id)
             LOGGER.debug(f'[{outbound_state.config.name}] Forwarded DMRD '
-                        f'(slot {_slot}, src {src_id}, dst {packet["dst_id_int"]}) '
-                        f'to {forwarded_count} local repeater(s)')
+                        f'{ts_tg} src={src_id} to {forwarded_count} local repeater(s)')
 
     
     # ========== END HELPER METHODS ==========
@@ -1521,8 +1531,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         """
         # Check if this is a unit/private call (call_type_bit == 1)
         if call_type_bit == 1:
-            LOGGER.info(f'UNIT CALL received on repeater {rid_to_int(repeater.repeater_id)} slot {slot}: '
-                       f'src={bytes_to_int(rf_src)}, dst={bytes_to_int(dst_id)}, '
+            # Unit calls address an individual radio ID rather than a talkgroup,
+            # and are never translated — no net/rf split to display.
+            LOGGER.info(f'UNIT CALL received on repeater {rid_to_int(repeater.repeater_id)} '
+                       f'TS/RID: {slot}/{bytes_to_int(dst_id)} src={bytes_to_int(rf_src)} '
                        f'stream_id={stream_id.hex()} [NOT ROUTED - unit call handling not yet implemented]')
             return False  # Reject the stream - don't process unit calls yet
         
@@ -1569,37 +1581,55 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Block: Different user trying different talkgroup (hijacking)
                 
                 # Same user can always continue (any talkgroup)
+                # Translate incoming and existing stream for log annotation.
+                if repeater.inbound_map:
+                    cur_net = repeater.inbound_map.get((current_stream.slot, current_stream.dst_id),
+                                                       (current_stream.slot, current_stream.dst_id))
+                    new_net = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+                else:
+                    cur_net = (current_stream.slot, current_stream.dst_id)
+                    new_net = (slot, dst_id)
+                new_ts_tg = fmt_ts_tg(new_net[0], new_net[1], slot, dst_id)
+
                 if current_stream.rf_src == rf_src:
                     if current_stream.dst_id == dst_id:
-                        LOGGER.info(f'Same user continuing conversation on repeater {rid_to_int(repeater.repeater_id)} slot {slot} '
-                                   f'during hang time: src={bytes_to_int(rf_src)}, dst={bytes_to_int(dst_id)}')
+                        LOGGER.info(f'Same user continuing conversation on repeater {rid_to_int(repeater.repeater_id)} '
+                                   f'{new_ts_tg} src={bytes_to_int(rf_src)} during hang time')
                     else:
-                        LOGGER.info(f'Same user switching talkgroup on repeater {rid_to_int(repeater.repeater_id)} slot {slot} '
-                                   f'during hang time: src={bytes_to_int(rf_src)}, '
-                                   f'old_dst={bytes_to_int(current_stream.dst_id)}, '
-                                   f'new_dst={bytes_to_int(dst_id)}')
+                        old_ts_tg = fmt_ts_tg(cur_net[0], cur_net[1], current_stream.slot, current_stream.dst_id)
+                        LOGGER.info(f'Same user switching talkgroup on repeater {rid_to_int(repeater.repeater_id)} '
+                                   f'during hang time: src={bytes_to_int(rf_src)} '
+                                   f'old {old_ts_tg} → new {new_ts_tg}')
                         fast_tg_switch = True  # Mark as fast talkgroup switch
                     # Allow by falling through to create new stream
                 # Different user - check if same talkgroup
                 elif current_stream.dst_id == dst_id:
-                    LOGGER.info(f'Different user joining conversation on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot} '
-                               f'during hang time: old_src={int.from_bytes(current_stream.rf_src, "big")}, '
-                               f'new_src={int.from_bytes(rf_src, "big")}, dst={int.from_bytes(dst_id, "big")}')
+                    LOGGER.info(f'Different user joining conversation on repeater {rid_to_int(repeater.repeater_id)} '
+                               f'{new_ts_tg} during hang time: '
+                               f'old_src={bytes_to_int(current_stream.rf_src)} new_src={bytes_to_int(rf_src)}')
                     # Allow by falling through to create new stream
                 else:
                     # Different user AND different talkgroup = hijacking attempt
-                    LOGGER.warning(f'Hang time hijacking blocked on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
-                                  f'slot reserved for TG {int.from_bytes(current_stream.dst_id, "big")}, '
-                                  f'denied src={int.from_bytes(rf_src, "big")} attempting TG {int.from_bytes(dst_id, "big")}')
+                    old_ts_tg = fmt_ts_tg(cur_net[0], cur_net[1], current_stream.slot, current_stream.dst_id)
+                    LOGGER.warning(f'Hang time hijacking blocked on repeater {rid_to_int(repeater.repeater_id)}: '
+                                  f'slot reserved for {old_ts_tg}, '
+                                  f'denied src={bytes_to_int(rf_src)} attempting {new_ts_tg}')
                     return False
             else:
                 # Active stream - different stream_id means contention
-                LOGGER.warning(f'Stream contention on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
-                              f'existing stream (src={int.from_bytes(current_stream.rf_src, "big")}, '
-                              f'dst={int.from_bytes(current_stream.dst_id, "big")}) '
-                              f'vs new stream (src={int.from_bytes(rf_src, "big")}, '
-                              f'dst={int.from_bytes(dst_id, "big")})')
-                
+                if repeater.inbound_map:
+                    cur_net = repeater.inbound_map.get((current_stream.slot, current_stream.dst_id),
+                                                       (current_stream.slot, current_stream.dst_id))
+                    new_net = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+                else:
+                    cur_net = (current_stream.slot, current_stream.dst_id)
+                    new_net = (slot, dst_id)
+                cur_ts_tg = fmt_ts_tg(cur_net[0], cur_net[1], current_stream.slot, current_stream.dst_id)
+                new_ts_tg = fmt_ts_tg(new_net[0], new_net[1], slot, dst_id)
+                LOGGER.warning(f'Stream contention on repeater {rid_to_int(repeater.repeater_id)}: '
+                              f'existing {cur_ts_tg} src={bytes_to_int(current_stream.rf_src)} '
+                              f'vs new {new_ts_tg} src={bytes_to_int(rf_src)}')
+
                 # Deny the new stream - first come, first served
                 return False
         
@@ -1611,13 +1641,20 @@ class HBProtocol(asyncio.DatagramProtocol):
             
             # Only log if this is the first packet of this denied stream
             if denial_key not in self._denied_streams:
-                tgid = int.from_bytes(dst_id, 'big')  # Convert only for logging
-                allowed_tgids = repeater.slot1_talkgroups if slot == 1 else repeater.slot2_talkgroups
-                # Convert bytes set to int list for logging display
+                # ACL check ran against net-side vocabulary — show that in the
+                # denial, annotated with the rf-side values when translated so
+                # operators can see both what the radio keyed and what the
+                # server evaluated.
+                if repeater.inbound_map:
+                    net_slot_d, net_dst_d = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+                else:
+                    net_slot_d, net_dst_d = slot, dst_id
+                allowed_tgids = repeater.slot1_talkgroups if net_slot_d == 1 else repeater.slot2_talkgroups
                 allowed_display = sorted(int.from_bytes(tg, 'big') for tg in allowed_tgids) if allowed_tgids else []
-                LOGGER.warning(f'Inbound routing denied: repeater={int.from_bytes(repeater.repeater_id, "big")} '
-                              f'TS{slot}/TG{tgid} not in allowed list {allowed_display}')
-                
+                ts_tg = fmt_ts_tg(net_slot_d, net_dst_d, slot, dst_id)
+                LOGGER.warning(f'Inbound routing denied: repeater={rid_to_int(repeater.repeater_id)} '
+                              f'{ts_tg} not in allowed list {allowed_display}')
+
                 # Add to denied cache
                 self._denied_streams[denial_key] = current_time
             
@@ -1656,14 +1693,15 @@ class HBProtocol(asyncio.DatagramProtocol):
         repeater.set_slot_stream(slot, new_stream)
         
         # Log stream start with fast talkgroup switch indicator and target count
+        ts_tg = fmt_ts_tg(net_slot, net_dst_id, slot, dst_id)
         if fast_tg_switch:
-            LOGGER.info(f'RX stream started on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
-                       f'src={int.from_bytes(rf_src, "big")}, dst={int.from_bytes(dst_id, "big")}, '
-                       f'stream_id={stream_id.hex()}, targets={len(target_repeaters)} [FAST TG SWITCH]')
+            LOGGER.info(f'RX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
+                       f'src={bytes_to_int(rf_src)} stream_id={stream_id.hex()} '
+                       f'targets={len(target_repeaters)} [FAST TG SWITCH]')
         else:
-            LOGGER.info(f'RX stream started on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
-                       f'src={int.from_bytes(rf_src, "big")}, dst={int.from_bytes(dst_id, "big")}, '
-                       f'stream_id={stream_id.hex()}, targets={len(target_repeaters)}')
+            LOGGER.info(f'RX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
+                       f'src={bytes_to_int(rf_src)} stream_id={stream_id.hex()} '
+                       f'targets={len(target_repeaters)}')
         
         # Emit stream_start event
         self._emit_stream_start(
@@ -2344,12 +2382,21 @@ class HBProtocol(asyncio.DatagramProtocol):
                     f'(group voice only)'
                 )
             
-            # Emit event to update dashboard in real-time
+            # Emit event to update dashboard in real-time. Translations are
+            # emitted as [rf_slot, rf_tgid, net_slot, net_tgid] tuples so the
+            # dashboard can show RF-side TGIDs on each card with a back-ref
+            # tooltip to the network side.
+            translations_list = [
+                [lslot, int.from_bytes(ltgid, 'big'),
+                 nslot, int.from_bytes(ntgid, 'big')]
+                for (lslot, ltgid), (nslot, ntgid) in sorted(new_inbound.items())
+            ]
             self._events.emit('repeater_options_updated', {
                 'repeater_id': rid_to_int(repeater_id),
                 'slot1_talkgroups': self._format_tg_json(final_ts1),
                 'slot2_talkgroups': self._format_tg_json(final_ts2),
-                'rpto_received': True
+                'rpto_received': True,
+                'translations': translations_list
             })
             
             # Send ACK
@@ -2689,7 +2736,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # Track assumed stream state on target repeater using target-local values
                 self._update_assumed_stream(target_repeater, out_slot, net_rf_src, out_dst,
                                            stream_id, is_terminator,
-                                           int.from_bytes(source_repeater_id, 'big'))
+                                           int.from_bytes(source_repeater_id, 'big'),
+                                           net_slot=net_slot, net_dst_id=net_dst_id)
     
     # ================================
     # DMR Packet Processing
@@ -2773,27 +2821,30 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Forward DMR data to other connected repeaters
         self._forward_stream(data, repeater_id, _slot, _rf_src, _dst_id, _stream_id)
 
-    def _update_assumed_stream(self, repeater: RepeaterState, slot: int, rf_src: bytes, 
+    def _update_assumed_stream(self, repeater: RepeaterState, slot: int, rf_src: bytes,
                               dst_id: bytes, stream_id: bytes, is_terminator: bool,
-                              source_repeater_id: int) -> None:
+                              source_repeater_id: int,
+                              net_slot: int = None, net_dst_id: bytes = None) -> None:
         """
         Update or create assumed stream state on a target repeater.
-        
+
         Since we're forwarding to this repeater but not receiving feedback,
         we must assume the stream state based on what we're sending.
-        
+
         Args:
             repeater: Target repeater state
-            slot: Timeslot
+            slot: Timeslot (target-local, i.e. what the target's RF side sees)
             rf_src: Source subscriber ID
-            dst_id: Destination TGID
+            dst_id: Destination TGID (target-local)
             stream_id: Stream identifier
             is_terminator: Whether this packet is a terminator
             source_repeater_id: ID of source repeater (for logging)
+            net_slot: Network-side timeslot (for log annotation when translated)
+            net_dst_id: Network-side TGID (for log annotation when translated)
         """
         current_stream = repeater.get_slot_stream(slot)
         current_time = time()
-        
+
         if not current_stream or current_stream.stream_id != stream_id:
             # New assumed stream starting
             new_stream = StreamState(
@@ -2809,12 +2860,13 @@ class HBProtocol(asyncio.DatagramProtocol):
                 is_assumed=True  # Mark as assumed stream
             )
             repeater.set_slot_stream(slot, new_stream)
-            
+
             # Log at DEBUG level - TX streams are noisy
-            LOGGER.debug(f'TX stream started on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
-                       f'from repeater {source_repeater_id}, '
-                       f'src={int.from_bytes(rf_src, "big")}, '
-                       f'dst={int.from_bytes(dst_id, "big")}')
+            ts_tg = fmt_ts_tg(net_slot if net_slot is not None else slot,
+                              net_dst_id if net_dst_id is not None else dst_id,
+                              slot, dst_id)
+            LOGGER.debug(f'TX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
+                       f'from repeater {source_repeater_id} src={bytes_to_int(rf_src)}')
             
             # Emit stream_start event for repeater card display (but marked as assumed)
             # Dashboard will filter these from Recent Events log

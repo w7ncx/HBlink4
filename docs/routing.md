@@ -101,3 +101,14 @@ When a call needs to be forwarded:
    - Send to target repeater
    - Create assumed stream state
    - Track for terminator/timeout
+
+## Interaction with DMRD translation
+
+When a trusted repeater declares DMRD translation rules via RPTO, the translation layer wraps the routing logic above:
+
+- **On ingress**, the packet's `(slot, dst_id)` is translated from the source repeater's local vocabulary to the network vocabulary **before** any of the steps above. Every ACL check, contention check, hang-time decision, and target-selection step in this document operates on network-side values.
+- **On egress**, the per-target `outbound_map` translates network → target-local **after** all routing decisions have been made. The slot-busy check (step 3 above) is performed against the target-local slot the packet will actually occupy on-air, not the network slot.
+
+`slot1_talkgroups` and `slot2_talkgroups` are always interpreted in network vocabulary. A repeater with no translation declared (the common case) sees no behavioral change — translation is a passthrough for untranslated TGIDs.
+
+See [dmrd_translation.md](dmrd_translation.md) for the full grammar and the step-by-step processing order.

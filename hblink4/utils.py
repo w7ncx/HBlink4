@@ -59,14 +59,43 @@ def rid_to_int(repeater_id: bytes) -> int:
 def bytes_to_int(value: bytes) -> int:
     """
     Simple bytes to int conversion for logging and display purposes.
-    
+
     Args:
         value: Bytes to convert
-        
+
     Returns:
         Integer representation
     """
     return int.from_bytes(value, 'big')
+
+
+def fmt_ts_tg(net_slot: int, net_tgid, rf_slot: int = None, rf_tgid=None) -> str:
+    """
+    Format a timeslot/talkgroup pair for log lines.
+
+    Returns "TS/TGID: 2/9" when there's no translation to annotate, or
+    "TS/TGID: 2/9 (rf: 1/3172)" when the RF-side (repeater-local) values
+    differ from the network-side values. The network side is always the
+    primary number because ACLs, subscriptions, and routing all reason in
+    that vocabulary.
+
+    Args:
+        net_slot: Network-side timeslot (1 or 2)
+        net_tgid: Network-side TGID — bytes (3-byte DMR format) or int
+        rf_slot: Optional RF-side timeslot (pass None to skip annotation)
+        rf_tgid: Optional RF-side TGID — bytes or int
+
+    Returns:
+        Formatted string suitable for inclusion in a log line.
+    """
+    net_tg_int = net_tgid if isinstance(net_tgid, int) else int.from_bytes(net_tgid, 'big')
+    base = f"TS/TGID: {net_slot}/{net_tg_int}"
+    if rf_slot is None or rf_tgid is None:
+        return base
+    rf_tg_int = rf_tgid if isinstance(rf_tgid, int) else int.from_bytes(rf_tgid, 'big')
+    if rf_slot == net_slot and rf_tg_int == net_tg_int:
+        return base
+    return f"{base} (rf: {rf_slot}/{rf_tg_int})"
 
 
 # Default connection type detection patterns (used if not in config)
