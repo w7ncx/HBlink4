@@ -21,44 +21,19 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import logging
 
+try:
+    from .user_db import UserDatabase, compute_next_refresh_seconds, _age_str
+except ImportError:
+    # Running the dashboard directly without package install
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).parent))
+    from user_db import UserDatabase, compute_next_refresh_seconds, _age_str
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="HBlink4 Dashboard", version="1.1.0")
-
-# Load user database from CSV
-def load_user_database() -> Dict[int, str]:
-    """
-    Load user.csv file for callsign lookups.
-    Returns dict mapping radio_id -> callsign (memory efficient).
-    """
-    user_db = {}
-    user_csv_path = Path(__file__).parent.parent / "user.csv"
-    
-    if not user_csv_path.exists():
-        logger.warning(f"user.csv not found at {user_csv_path}, callsign lookups disabled")
-        return user_db
-    
-    try:
-        with open(user_csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    radio_id = int(row['RADIO_ID'])
-                    callsign = row['CALLSIGN'].strip()
-                    if callsign:  # Only store non-empty callsigns
-                        user_db[radio_id] = callsign
-                except (ValueError, KeyError):
-                    continue  # Skip malformed rows
-        
-        logger.info(f"Loaded {len(user_db)} users from user.csv (~{len(user_db) * 14 // 1024} KB)")
-        return user_db
-    except Exception as e:
-        logger.error(f"Failed to load user.csv: {e}")
-        return user_db
-
-user_database = load_user_database()
 
 # Load dashboard configuration
 def load_config() -> dict:
@@ -77,6 +52,26 @@ def load_config() -> dict:
             "unix_socket": "/tmp/hblink4.sock",
             "ipv6": False,
             "buffer_size": 65536
+        },
+        "user_database": {
+            "enabled": True,
+            "source_url": "https://database.radioid.net/static/user.csv",
+            "user_agent": "HBlink4-Dashboard (contact=operator@example.org)",
+            "refresh": {
+                "schedule": "daily",
+                "time_of_day": "03:17",
+                "jitter_minutes": 15,
+                "on_startup_if_older_than_hours": 36
+            },
+            "filter": {
+                "countries": ["United States", "Canada"],
+                "callsign_regex": None,
+                "radio_id_ranges": None
+            },
+            "fallback": {
+                "keep_stale_on_failure": True,
+                "min_rows_required": 1000
+            }
         }
     }
     
@@ -127,7 +122,12 @@ class DashboardState:
         self._stats_file = self._data_dir / "stats.json"
         self._last_heard_file = self._data_dir / "last_heard.json"
         self._persistence_disabled = False  # Will be set to True if write permissions fail
-        
+
+        # User database (radio_id -> callsign) with background refresh.
+        # Loaded from disk snapshot on startup; populated/refreshed by
+        # user_db_refresh_task() registered in startup_event().
+        self.user_db = UserDatabase(self._data_dir)
+
         # Load persisted data
         self._load_persisted_data()
     
@@ -147,6 +147,7 @@ class DashboardState:
             self._cleanup_temp_files()
             self._load_stats()
             self._load_last_heard()
+            self.user_db.load_from_disk()
             self._purge_old_data()
             logger.info("📁 Loaded persisted dashboard data")
         except PermissionError as e:
@@ -681,7 +682,7 @@ class EventReceiver:
             
             # Look up callsign from user database
             src_id = data.get('rf_src') or data.get('src_id')  # Handle both field names
-            callsign = user_database.get(src_id, '') if src_id else ''
+            callsign = state.user_db.get(src_id, '') if src_id else ''
             
             state.streams[key] = {
                 **data,
@@ -1058,7 +1059,8 @@ async def websocket_endpoint(websocket: WebSocket):
             'events': list(state.events)[-50:],
             'stats': state.stats,
             'last_heard': state.last_heard,
-            'hblink_connected': state.hblink_connected
+            'hblink_connected': state.hblink_connected,
+            'user_db_status': state.user_db.status_dict()
         }
     })
     
@@ -1111,9 +1113,20 @@ async def startup_event():
     )
     asyncio.create_task(receiver.start())
     asyncio.create_task(midnight_reset_task())
+    asyncio.create_task(user_db_refresh_task())
     logger.info("🚀 HBlink4 Dashboard started!")
     logger.info(f"📡 Event transport: {receiver_config.get('transport', 'unix').upper()}")
     logger.info("📊 Access dashboard at http://localhost:8080")
+
+    # Warn operator if they left the placeholder contact in the User-Agent.
+    udb_cfg = dashboard_config.get("user_database", {}) or {}
+    ua = udb_cfg.get("user_agent", "")
+    if "operator@example.org" in ua:
+        logger.warning(
+            "⚠️ user_database.user_agent still contains the placeholder contact "
+            "'operator@example.org' — update it in config.json so radioid.net can "
+            "reach you if there's an issue with your traffic."
+        )
 
 
 @app.on_event("shutdown")
@@ -1133,9 +1146,85 @@ async def midnight_reset_task():
             state.reset_daily_stats()
             # Send stats update to all WebSocket clients
             await send_stats_update()
-        
+
         # Check every 60 seconds
         await asyncio.sleep(60)
+
+
+async def user_db_refresh_task():
+    """
+    Background task that refreshes the user database from radioid.net.
+
+    - On startup: if the on-disk snapshot is missing or older than
+      `on_startup_if_older_than_hours`, run one catch-up refresh immediately.
+    - Then loop: sleep until the next scheduled time_of_day + jitter, refresh,
+      repeat.
+    - Respects `user_database.enabled=false` as a hard disable.
+    - Broadcasts a user_db_status event after each refresh attempt so the UI
+      can show "DB updated Nh ago" without a full page reload.
+    """
+    # Wait a moment for the startup log to settle, then evaluate state.
+    await asyncio.sleep(2)
+
+    udb_cfg = dashboard_config.get("user_database", {}) or {}
+    if not udb_cfg.get("enabled", True):
+        logger.info("📘 user_database.enabled=false — background refresh disabled")
+        return
+
+    refresh_cfg = udb_cfg.get("refresh", {}) or {}
+    startup_threshold_h = float(refresh_cfg.get("on_startup_if_older_than_hours", 36))
+
+    # Startup catch-up: run now if the snapshot is missing or stale.
+    age_h = state.user_db.snapshot_age_hours()
+    if age_h is None or age_h >= startup_threshold_h:
+        logger.info(
+            f"📘 user_db snapshot age={age_h}h >= threshold {startup_threshold_h}h — "
+            "running catch-up refresh"
+        )
+        status = await state.user_db.refresh_from_upstream(udb_cfg)
+        await broadcast_user_db_status(trigger="startup", status=status)
+
+    while True:
+        # Compute next scheduled refresh.
+        delay = compute_next_refresh_seconds(
+            schedule=refresh_cfg.get("schedule", "daily"),
+            time_of_day=refresh_cfg.get("time_of_day", "03:17"),
+            jitter_minutes=int(refresh_cfg.get("jitter_minutes", 15)),
+        )
+        logger.info(
+            f"📘 Next user_db refresh in {delay / 3600:.1f}h "
+            f"(schedule={refresh_cfg.get('schedule', 'daily')}, "
+            f"time_of_day={refresh_cfg.get('time_of_day', '03:17')})"
+        )
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            logger.debug("user_db_refresh_task cancelled during sleep")
+            return
+
+        status = await state.user_db.refresh_from_upstream(udb_cfg)
+        await broadcast_user_db_status(trigger="scheduled", status=status)
+
+
+async def broadcast_user_db_status(trigger: str, status: str):
+    """Send a user_db_status event to all connected clients."""
+    if not state.websocket_clients:
+        return
+    payload = state.user_db.status_dict()
+    payload["trigger"] = trigger
+    payload["status"] = status
+    message = json.dumps({
+        "type": "user_db_status",
+        "timestamp": datetime.now().timestamp(),
+        "data": payload,
+    })
+    disconnected = set()
+    for client in state.websocket_clients:
+        try:
+            await client.send_text(message)
+        except Exception:
+            disconnected.add(client)
+    state.websocket_clients -= disconnected
 
 
 async def send_stats_update():

@@ -798,7 +798,10 @@
         </div>
         
         <!-- Last Heard Users (Last 10) -->
-        <h2 class="section-header" style="margin-top: 20px; margin-bottom: 10px;">Last Heard</h2>
+        <h2 class="section-header" style="margin-top: 20px; margin-bottom: 10px;">
+            Last Heard
+            <span id="userDbStatus" style="font-size: 0.55em; color: #9ca3af; font-weight: 400; margin-left: 10px;"></span>
+        </h2>
         <div class="card">
             <div style="overflow-x: auto;">
                 <table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
@@ -885,7 +888,8 @@
                 total_duration_today: 0,
                 retransmitted_calls: 0
             },
-            config: {}
+            config: {},
+            user_db_status: null
         };
         
         // Audio notification system
@@ -1031,16 +1035,18 @@
                     state.events = data.data.events;
                     state.stats = data.data.stats;
                     state.last_heard = data.data.last_heard || [];
-                    
+                    state.user_db_status = data.data.user_db_status || null;
+
                     // Update HBlink connection status
                     updateHBlinkStatus(data.data.hblink_connected || false);
-                    
+
                     updateRepeaters(state.repeaters);
                     updateOutbounds(state.outbounds);
                     updateStreams(state.streams);
                     updateEvents(state.events);
                     updateStats(state.stats, state.repeaters, state.streams);
                     updateLastHeard(state.last_heard);
+                    updateUserDbStatus(state.user_db_status);
                 } else if (data.type === 'hblink_status') {
                     // HBlink4 connection status changed
                     updateHBlinkStatus(data.data.connected);
@@ -1048,6 +1054,10 @@
                     // Midnight reset - update stats immediately
                     state.stats = data.data;
                     updateStats(state.stats, state.repeaters, state.streams);
+                } else if (data.type === 'user_db_status') {
+                    // User database refresh completed (success or failure)
+                    state.user_db_status = data.data;
+                    updateUserDbStatus(state.user_db_status);
                 } else {
                     // Process event immediately for real-time updates
                     processEventUpdate(data);
@@ -1872,6 +1882,49 @@
             }).join('');
         }
         
+        function updateUserDbStatus(status) {
+            const el = document.getElementById('userDbStatus');
+            if (!el) return;
+            if (!status) { el.textContent = ''; el.title = ''; return; }
+
+            const rows = status.loaded_rows || 0;
+            const ts = status.refresh_timestamp || 0;
+            const srcStatus = status.source_status || 'unknown';
+
+            let ageStr;
+            if (!ts) {
+                ageStr = 'never refreshed';
+            } else {
+                const elapsed = Math.floor(Date.now() / 1000 - ts);
+                if (elapsed < 60) ageStr = `${elapsed}s ago`;
+                else if (elapsed < 3600) ageStr = `${Math.floor(elapsed / 60)}m ago`;
+                else if (elapsed < 86400) ageStr = `${Math.floor(elapsed / 3600)}h ago`;
+                else ageStr = `${Math.floor(elapsed / 86400)}d ago`;
+            }
+
+            let color = '#9ca3af';
+            if (srcStatus === 'error') color = '#fbbf24';            // gold, matches other warnings
+            else if (srcStatus === 'not_modified' || srcStatus === 'ok') color = '#9ca3af';
+
+            el.style.color = color;
+            el.textContent = `Callsign DB: ${rows.toLocaleString()} entries, updated ${ageStr}`;
+
+            // Verbose hover so operators can diagnose without digging into logs.
+            const parts = [
+                `Source: ${status.source_url || '(unset)'}`,
+                `Status: ${srcStatus}`,
+                `Rows: ${rows.toLocaleString()}`
+            ];
+            if (status.last_modified_header) parts.push(`Upstream Last-Modified: ${status.last_modified_header}`);
+            if (status.last_error) parts.push(`Last error: ${status.last_error}`);
+            el.title = parts.join('\n');
+        }
+
+        // Re-tick the age string every 60s so it stays fresh between pushes.
+        setInterval(() => {
+            if (state.user_db_status) updateUserDbStatus(state.user_db_status);
+        }, 60000);
+
         function updateLastHeard(users) {
             const tbody = document.getElementById('lastHeardTable');
             

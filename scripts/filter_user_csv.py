@@ -2,12 +2,18 @@
 """
 Filter user.csv to only include US and Canada entries.
 
+DEPRECATED: as of April 2026, the dashboard fetches and filters user.csv
+automatically on a daily schedule (see dashboard/user_db.py and
+docs/user_csv_automation_proposal.md). This script is kept functional as a
+manual fallback for air-gapped deployments or operators who prefer to shuttle
+the file in by hand. It may be removed in a future release.
+
 Usage:
     python3 scripts/filter_user_csv.py <input.csv> [output.csv]
-    
+
 Example:
     python3 scripts/filter_user_csv.py user_full.csv user.csv
-    
+
 If no output file specified, will overwrite the input file.
 """
 
