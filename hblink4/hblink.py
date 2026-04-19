@@ -1288,6 +1288,13 @@ class HBProtocol(asyncio.DatagramProtocol):
             translated = repeater.inbound_map.get((slot, dst_id))
             if translated is not None:
                 slot, dst_id = translated
+            elif (slot, dst_id) in repeater.outbound_map:
+                # Repeater keyed the net-side address for a TG it declared a
+                # local alias for. The subscription set carries the net-side
+                # TGID (needed for forwarding TO this repeater), so without
+                # this guard the packet would sneak past ACL on the net-side
+                # key instead of the declared local one.
+                return False
 
         # Get slot-specific talkgroup set from repeater state
         allowed_tgids = repeater.slot1_talkgroups if slot == 1 else repeater.slot2_talkgroups
@@ -1641,19 +1648,33 @@ class HBProtocol(asyncio.DatagramProtocol):
             
             # Only log if this is the first packet of this denied stream
             if denial_key not in self._denied_streams:
-                # ACL check ran against net-side vocabulary — show that in the
-                # denial, annotated with the rf-side values when translated so
-                # operators can see both what the radio keyed and what the
-                # server evaluated.
-                if repeater.inbound_map:
-                    net_slot_d, net_dst_d = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+                # Special case: repeater used the net-side address for a TG
+                # it declared a local alias for. Call it out explicitly so
+                # the operator sees it's a mis-keyed address, not an ACL miss.
+                if (repeater.inbound_map
+                        and (slot, dst_id) in repeater.outbound_map
+                        and (slot, dst_id) not in repeater.inbound_map):
+                    rf_slot_d, rf_dst_d = repeater.outbound_map[(slot, dst_id)]
+                    LOGGER.warning(
+                        f'Inbound rejected: repeater={rid_to_int(repeater.repeater_id)} '
+                        f'keyed net-side TS{slot}/TG{int.from_bytes(dst_id, "big")} '
+                        f'for a translated TG — local side is '
+                        f'TS{rf_slot_d}/TG{int.from_bytes(rf_dst_d, "big")}'
+                    )
                 else:
-                    net_slot_d, net_dst_d = slot, dst_id
-                allowed_tgids = repeater.slot1_talkgroups if net_slot_d == 1 else repeater.slot2_talkgroups
-                allowed_display = sorted(int.from_bytes(tg, 'big') for tg in allowed_tgids) if allowed_tgids else []
-                ts_tg = fmt_ts_tg(net_slot_d, net_dst_d, slot, dst_id)
-                LOGGER.warning(f'Inbound routing denied: repeater={rid_to_int(repeater.repeater_id)} '
-                              f'{ts_tg} not in allowed list {allowed_display}')
+                    # ACL check ran against net-side vocabulary — show that
+                    # in the denial, annotated with the rf-side values when
+                    # translated so operators can see both what the radio
+                    # keyed and what the server evaluated.
+                    if repeater.inbound_map:
+                        net_slot_d, net_dst_d = repeater.inbound_map.get((slot, dst_id), (slot, dst_id))
+                    else:
+                        net_slot_d, net_dst_d = slot, dst_id
+                    allowed_tgids = repeater.slot1_talkgroups if net_slot_d == 1 else repeater.slot2_talkgroups
+                    allowed_display = sorted(int.from_bytes(tg, 'big') for tg in allowed_tgids) if allowed_tgids else []
+                    ts_tg = fmt_ts_tg(net_slot_d, net_dst_d, slot, dst_id)
+                    LOGGER.warning(f'Inbound routing denied: repeater={rid_to_int(repeater.repeater_id)} '
+                                  f'{ts_tg} not in allowed list {allowed_display}')
 
                 # Add to denied cache
                 self._denied_streams[denial_key] = current_time

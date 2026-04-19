@@ -94,7 +94,7 @@ Translation is **the first thing that happens on ingress and the last thing that
 **Ingress (packet arrives from a repeater), in order:**
 
 1. Packet enters with source-local `(slot, dst_id)`.
-2. **Translation applied**: `inbound_map` rewrites `(slot, dst_id)` to net values. No map = passthrough.
+2. **Translation applied**: `inbound_map` rewrites `(slot, dst_id)` to net values. No map = passthrough. If the key misses `inbound_map` but *is* in `outbound_map`, the repeater keyed the net-side address for a TG it already declared a local alias for — the packet is rejected (see [Net-side addressing is rejected](#net-side-addressing-is-rejected) below).
 3. Contention / hang time / hijack checks run against the source's stored stream state. *(StreamState still stores source-local values so same-user comparisons work regardless of translation.)*
 4. Inbound ACL checked against the repeater's subscription set (network vocabulary).
 5. Stream targets calculated; per-target `outbound_map` applied at packet-rewrite time.
@@ -109,6 +109,25 @@ Translation is **the first thing that happens on ingress and the last thing that
 6. Packet sent on the wire.
 
 The practical upshot: when you configure subscriptions, contention rules, or ACLs, think in **network vocabulary**. The translation layer makes sure whatever arrives (or leaves) lines up with what the rest of the server expects.
+
+### Net-side addressing is rejected
+
+Once a repeater declares a translation for a `(net_slot, net_tgid)`, that pair becomes a **network-only** key — the repeater must key its local `(local_slot, local_tgid)` instead. A packet arriving on the declared net-side key is rejected.
+
+This is needed because the subscription set still carries the net-side TGID (it has to — that's how traffic gets forwarded *to* this repeater). Without the guard, a packet that arrived on the net-side address would miss `inbound_map`, fall through untranslated, and then pass ACL because the net-side TGID is in the subscription set — silently bypassing the operator's declared local vocabulary.
+
+Example with `Options="TS2=3120:1:9"`:
+
+- Keying local TS1/TG9 → translated to net TS2/TG3120, forwarded. ✅
+- Keying net TS2/TG3120 → rejected. ❌
+
+Denial log line:
+
+```
+Inbound rejected: repeater=3100001 keyed net-side TS2/TG3120 for a translated TG — local side is TS1/TG9
+```
+
+If the repeater legitimately wants the same `(slot, tgid)` pair on both sides (identity map), declare it explicitly — e.g., `TS1=3000-3200:2:*,3120:1:3120` keeps TG3120 on TS1 for both sides while mapping the rest of the range to TS2. Identity-mapped entries land in both `inbound_map` and `outbound_map` and are translated (to themselves) rather than rejected.
 
 ### Payload blanking
 
