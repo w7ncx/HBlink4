@@ -54,6 +54,12 @@ try:
     from .models import (
         OutboundConnectionConfig, StreamState, OutboundState, RepeaterState
     )
+    from .lc import (
+        LC_OPT_GROUP_DEFAULT, LC_CARRIER_NONE, LC_CARRIER_VHEAD,
+        LC_CARRIER_VTERM, LC_CARRIER_EMB, build_lc, synth_lc_base,
+        decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
+        classify_lc_carrier,
+    )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from constants import (
@@ -76,6 +82,12 @@ except ImportError:
     )
     from models import (
         OutboundConnectionConfig, StreamState, OutboundState, RepeaterState
+    )
+    from lc import (
+        LC_OPT_GROUP_DEFAULT, LC_CARRIER_NONE, LC_CARRIER_VHEAD,
+        LC_CARRIER_VTERM, LC_CARRIER_EMB, build_lc, synth_lc_base,
+        decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
+        classify_lc_carrier,
     )
 
 # Data classes moved to models.py
@@ -743,9 +755,22 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         # Find local repeaters that should receive this traffic.
         # Source is an outbound connection → (_slot, _dst_id, _rf_src) already
-        # network-side. Per-target, apply outbound_map (net → target-local) and
-        # optional reverse subscriber NAT, plus data-sync payload blanking.
-        _payload_blank = (_frame_type == 2)
+        # network-side. Per-target, apply outbound_map (net → target-local)
+        # and rewrite the embedded LC on VHEAD/VTERM/burst-B-E frames when
+        # translation changes the addressing MMDVMHost would see.
+        _dtype_vseq = data[15] & 0xF
+        lc_carrier = classify_lc_carrier(_frame_type, _dtype_vseq)
+
+        # Capture the stream's source-of-truth LC once (from VHEAD if this
+        # frame is one, else synthesize). outbound-sourced streams use their
+        # own StreamState on outbound_state to hold lc_base / lc_cache.
+        rx_stream = outbound_state.get_slot_stream(_slot)
+        if rx_stream is not None and rx_stream.lc_base is None:
+            decoded_lc = None
+            if lc_carrier == LC_CARRIER_VHEAD:
+                decoded_lc = decode_lc_from_vhead(data[20:53])
+            rx_stream.lc_base = decoded_lc or synth_lc_base(_dst_id, _rf_src)
+
         forwarded_count = 0
         for local_repeater_id, local_repeater in self._repeaters.items():
             # Only forward to connected repeaters
@@ -770,8 +795,17 @@ class HBProtocol(asyncio.DatagramProtocol):
             if self._is_slot_busy(local_repeater_id, out_slot, _stream_id, _rf_src, out_dst):
                 continue
 
-            # Rewrite if any translation is in play or if this is a data-sync frame
-            if (not _payload_blank and (out_slot, out_dst) == (_slot, _dst_id)):
+            # Addressing this target will see. LC needs rewriting only when
+            # (out_dst, out_src) differs from what's already encoded by the
+            # upstream sender AND the frame actually carries an LC.
+            header_unchanged = (out_slot, out_dst) == (_slot, _dst_id)
+            lc_needs_rewrite = (
+                lc_carrier != LC_CARRIER_NONE
+                and rx_stream is not None
+                and rx_stream.lc_base is not None
+                and out_dst != _dst_id
+            )
+            if header_unchanged and not lc_needs_rewrite:
                 self._send_packet(data, local_repeater.sockaddr)
             else:
                 buf = bytearray(data)
@@ -783,8 +817,23 @@ class HBProtocol(asyncio.DatagramProtocol):
                         buf[15] |= 0x80
                     else:
                         buf[15] &= 0x7F
-                if _payload_blank:
-                    buf[20:53] = b'\x00' * 33
+                if lc_needs_rewrite:
+                    lc_cache = rx_stream.lc_cache
+                    cache_key = (out_dst, _rf_src)
+                    entry = lc_cache.get(cache_key)
+                    if entry is None:
+                        entry = encode_lc_forms(
+                            build_lc(rx_stream.lc_base[0:3], out_dst, _rf_src)
+                        )
+                        lc_cache[cache_key] = entry
+                    h_lc, t_lc, emb_lc = entry
+                    payload = bytes(buf[20:53])
+                    if lc_carrier == LC_CARRIER_VHEAD:
+                        buf[20:53] = splice_full_lc(payload, h_lc)
+                    elif lc_carrier == LC_CARRIER_VTERM:
+                        buf[20:53] = splice_full_lc(payload, t_lc)
+                    elif lc_carrier == LC_CARRIER_EMB:
+                        buf[20:53] = splice_emb_lc(payload, emb_lc[_dtype_vseq])
                 self._send_packet(bytes(buf), local_repeater.sockaddr)
             forwarded_count += 1
 
@@ -2614,11 +2663,15 @@ class HBProtocol(asyncio.DatagramProtocol):
           - bytes  5-7  rf_src (subscriber NAT, if configured on source)
           - bytes  8-10 dst_id (target-local or network, per target's outbound_map)
           - byte   15   slot bit (follows translated slot)
-          - bytes 20-52 payload: on data-sync frames (frame_type==2: LC header /
-            terminator / CSBK) we ZERO the 33-byte payload so MMDVMHost's BPTC
-            decode fails and it falls back to the DMRD header values we just
-            rewrote. Voice frames (frame_type 0/1) keep the AMBE vocoder bits
-            intact — MMDVMHost regenerates sync/EMB/slot-type/LC overhead.
+          - bytes 20-52 payload: for LC-bearing frames we re-encode the Link
+            Control to match the outbound addressing. VHEAD (frame_type=2,
+            dtype_vseq=1) and VTERM (frame_type=2, dtype_vseq=2) frames get
+            their 196-bit BPTC LC codeword replaced, preserving the 68-bit
+            slot-type/sync window at bits [98:166]. Voice bursts B/C/D/E
+            (voice frame, dtype_vseq 1..4) get their 32-bit embedded LC
+            fragment at bits [116:148] replaced — AMBE vocoder bits are
+            untouched. All other frames (burst A, CSBK, data headers) pass
+            through with payload intact.
 
         Args:
             data: Complete DMRD packet (20-byte HBP header + 33-byte DMR data)
@@ -2668,25 +2721,68 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Check if this is a terminator packet (use original data bits for check)
         _bits = data[15]
         _frame_type = (_bits & 0x30) >> 4
+        _dtype_vseq = _bits & 0xF
         is_terminator = self._is_dmr_terminator(data, _frame_type)
 
-        # Pre-compute a shared "network-addressed" packet buffer when the source
-        # translated (or NATted). Targets then either send this as-is (no
-        # outbound_map) or clone+rewrite for their own local addressing.
+        # Does this frame carry an LC we need to rewrite under translation?
+        # Only VHEAD/VTERM (full LC) and voice bursts B/C/D/E (EMB_LC) do.
+        lc_carrier = classify_lc_carrier(_frame_type, _dtype_vseq)
+
+        # Lazily capture the stream's source-of-truth LC. Prefer decoding
+        # the originator's VHEAD so FLCO/FID/service-options survive; fall
+        # back to a synthesized group-voice LC for late-entry streams where
+        # VHEAD was missed. Private/unit-call LC will slot in here when
+        # those calls are enabled — today only group voice is forwarded.
+        if source_stream.lc_base is None:
+            decoded_lc: Optional[bytes] = None
+            if lc_carrier == LC_CARRIER_VHEAD:
+                decoded_lc = decode_lc_from_vhead(data[20:53])
+            if decoded_lc is not None:
+                source_stream.lc_base = decoded_lc
+            else:
+                source_stream.lc_base = synth_lc_base(dst_id, rf_src)
+
+        # Source-side translation = source's own addressing diverges from
+        # what goes on the wire. Drives whether targets need rewrite at all.
         source_translated = (net_slot, net_dst_id) != (slot, dst_id) or net_rf_src != rf_src
-        # Data-sync frames get payload blanked on every outgoing packet per spec.
-        payload_blank = (_frame_type == 2)
+
+        lc_opts = source_stream.lc_base[0:3]
+        lc_cache = source_stream.lc_cache
+
+        def get_encoded_lc(out_dst: bytes, out_src: bytes):
+            """Return cached (h_lc, t_lc, emb_lc) for this target addressing.
+
+            One BPTC encode per (dst, src) tuple per stream — subsequent
+            frames hit the cache. Slot isn't keyed because LC doesn't carry
+            slot info.
+            """
+            key = (out_dst, out_src)
+            entry = lc_cache.get(key)
+            if entry is None:
+                entry = encode_lc_forms(build_lc(lc_opts, out_dst, out_src))
+                lc_cache[key] = entry
+            return entry
 
         def build_target_packet(out_slot: int, out_dst: bytes, out_src: bytes,
                                 out_repeater_id: Optional[bytes]) -> bytes:
-            """Return a DMRD packet with the requested header fields + blanking."""
-            # Fast path: no rewrites needed at all.
-            if (not payload_blank
-                    and out_slot == slot
-                    and out_dst == dst_id
-                    and out_src == rf_src
-                    and out_repeater_id is None):
+            """Return a DMRD packet rewritten for this target's addressing."""
+            # Fast path: no header rewrite needed AND no LC rewrite needed.
+            header_unchanged = (
+                out_slot == slot
+                and out_dst == dst_id
+                and out_src == rf_src
+                and out_repeater_id is None
+            )
+            if header_unchanged and lc_carrier == LC_CARRIER_NONE:
                 return data
+            # If the outbound addressing exactly matches what the originator
+            # already put in the LC, its own payload is correct — no splice.
+            lc_needs_rewrite = lc_carrier != LC_CARRIER_NONE and (
+                out_dst != dst_id or out_src != rf_src
+            )
+            if header_unchanged and not lc_needs_rewrite:
+                return data
+
             buf = bytearray(data)
             if out_src != rf_src:
                 buf[5:8] = out_src
@@ -2701,10 +2797,16 @@ class HBProtocol(asyncio.DatagramProtocol):
                     buf[15] |= 0x80
                 else:
                     buf[15] &= 0x7F
-            if payload_blank:
-                # Zero 33-byte DMR payload on data-sync frames so MMDVMHost
-                # falls back to our rewritten DMRD header.
-                buf[20:53] = b'\x00' * 33
+
+            if lc_needs_rewrite:
+                h_lc, t_lc, emb_lc = get_encoded_lc(out_dst, out_src)
+                payload = bytes(buf[20:53])
+                if lc_carrier == LC_CARRIER_VHEAD:
+                    buf[20:53] = splice_full_lc(payload, h_lc)
+                elif lc_carrier == LC_CARRIER_VTERM:
+                    buf[20:53] = splice_full_lc(payload, t_lc)
+                elif lc_carrier == LC_CARRIER_EMB:
+                    buf[20:53] = splice_emb_lc(payload, emb_lc[_dtype_vseq])
             return bytes(buf)
 
         # Simple loop through cached targets - no per-packet checks!
@@ -2745,8 +2847,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                 else:
                     out_slot, out_dst = net_slot, net_dst_id
 
-                # Fast path: no source translation, no target translation, no blanking
-                if (not payload_blank and not source_translated
+                # Fast path: no source translation, no target translation, no
+                # LC rewrite needed — ship the original buffer as-is.
+                if (lc_carrier == LC_CARRIER_NONE
+                        and not source_translated
                         and (out_slot, out_dst) == (slot, dst_id)
                         and net_rf_src == rf_src):
                     self._send_packet(data, target_repeater.sockaddr)

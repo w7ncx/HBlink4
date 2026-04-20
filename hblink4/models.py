@@ -88,7 +88,25 @@ class StreamState:
     is_assumed: bool = False  # True if this is an assumed stream (forwarded to target, not received from it)
     target_repeaters: Optional[set] = None  # Cached set of repeater_ids approved for forwarding
     routing_cached: bool = False  # True once routing has been calculated
-    
+
+    # DMR Link Control for outbound rewrites under translation.
+    #
+    # lc_base: the 9-byte LC (3B opts + 3B dst + 3B src) captured once at
+    # stream start. Decoded from VHEAD when the first forwarded frame is a
+    # voice header (preserves FLCO/FID/service-options); otherwise synthesized
+    # from LC_OPT_GROUP_DEFAULT + dst_id + rf_src. Source-local addressing
+    # — per-target LCs are built from lc_base[0:3] + out_dst + out_src.
+    #
+    # lc_cache: per-target encoded forms keyed on the outbound (dst, src)
+    # tuple (slot doesn't affect LC contents). Entry is
+    #   (h_lc: 196-bit bitarray, t_lc: 196-bit bitarray,
+    #    emb_lc: {1..4} → 32-bit bitarray)
+    # Lazy-filled on first frame that needs a rewrite for that addressing,
+    # so untranslated targets pay nothing and translated targets pay one
+    # BPTC encode per (dst, src) for the life of the stream.
+    lc_base: Optional[bytes] = None
+    lc_cache: Dict[Tuple[bytes, bytes], Any] = field(default_factory=dict)
+
     def is_active(self, timeout: float = 2.0) -> bool:
         """Check if stream is still active (within timeout period)"""
         return (time() - self.last_seen) < timeout
