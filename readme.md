@@ -3,7 +3,7 @@
 HBlink4 is a DMR Server implementation using the HomeBrew protocol, developed by Cort Buffington, N0MJS. HBlink4 operates as an endpoint network server with granular per-repeater control and does not implement transit call-routing between DMR networks.
 
 There has been some chatter coming my way about what is "official" with respect to HBlink. I can't stop others from claiming they are the "official" source, or using account names that make them look officical. All I can say is that I'm the author, and I'm the copyright holder. What is the status?
- - **HBlink:** Original Python2 based system, interacted with DMRlink for IPSC/HBP translations. Worked on a "system" level and supporter internetworking via a "conference bridge" paradigm. Highly configurable for a time before DMRgateway. Status: DEPRECIATED
+ - **HBlink:** Original Python2 based system, interacted with DMRlink for IPSC/HBP translations. Worked on a "system" level and supported internetworking via a "conference bridge" paradigm. Highly configurable for a time before DMRgateway. Status: DEPRECIATED
  - **HBlink3:** Rewrite in Python3, mostly the same code base updated. Dropped direct support for IPSC/HBP translations. Status: DEPRECIATED
  - **HBlink4:** Ground up re-write for modern times. Repeater, not system based. Supports full dynamic TGID subscription and TS/TGID translation based on "Options" configuration send by MMDVMHost or DMRGatway. Includes integrated dashboard application as part of the package. ACTIVE DEVELOPMENT. 
 
