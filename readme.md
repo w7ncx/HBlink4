@@ -25,7 +25,7 @@ HBlink4 focuses on being an efficient **endpoint network server** with the follo
 - **Real-time duration counter with 1-second updates**
 - **Two-tier stream end detection (immediate terminator + timeout fallback)**
 - **Per-repeater DMRD translation** - slot/TGID remap and outbound rf_src override declared via RPTO (see [DMRD Translation](docs/dmrd_translation.md))
-- **User routing cache for efficient private call routing**
+- **Unit (private) call routing** - User cache with broadcast fallback, subscriber-pair hang time, cross-slot support, and optional forwarding over outbound server links (implicit reverse-path tree when peers are HBlink4)
 - Pattern-based repeater configuration and blacklisting
 - Per-slot transmission management
 
@@ -92,7 +92,7 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[Protocol Specification](docs/protocol.md)** - HomeBrew DMR protocol details
 - **[Integration Guide](docs/integration.md)** - Using HBlink4 as a module
 - **[Logging](docs/logging.md)** - Log management and rotation
-- **[Roadmap / TODO](docs/TODO.md)** - Planned work (unit calls, performance monitoring, config UI)
+- **[Roadmap / TODO](docs/TODO.md)** - Planned work (performance monitoring, multi-hop outbound, config UI)
 - **[OpenBridge Analysis](docs/OPENBRIDGE_ANALYSIS.md)** - Reference analysis for future OpenBridge support
 - **[Release Notes v4.7.0](docs/RELEASE_NOTES_v4.7.0.md)** - Current release — asyncio, DMRA, outbound connections, DMRD translation
 

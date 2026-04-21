@@ -811,7 +811,7 @@
                             <th style="padding: 8px; text-align: left;">Callsign/Alias</th>
                             <th style="padding: 8px; text-align: left;">Source</th>
                             <th style="padding: 8px; text-align: center;">Slot</th>
-                            <th style="padding: 8px; text-align: left;">Talkgroup</th>
+                            <th style="padding: 8px; text-align: left;">Destination</th>
                             <th style="padding: 8px; text-align: left;">Last Heard</th>
                         </tr>
                     </thead>
@@ -1991,14 +1991,24 @@
                     ? ` <span title="Translated: RF TS${xlate[0]}/TG${xlate[1]} ↔ Net TS${xlate[2]}/TG${xlate[3]}">🔀</span>`
                     : '';
                 const source = (user.source_name || user.repeater_id || '-') + srcXlateEmoji;
-                
+
+                // Destination rendering: group calls get 👥 with a TG label,
+                // unit (private) calls get 👤 with the target radio ID. The
+                // emoji also carries a title tooltip; if emoji fail to render
+                // the "Group"/"Unit" word in the title is still meaningful.
+                const isUnit = user.call_type === 'private';
+                const destEmoji = isUnit
+                    ? '<span title="Unit (private) call">👤</span>'
+                    : '<span title="Group call">👥</span>';
+                const destination = `${destEmoji} ${user.talkgroup}`;
+
                 return `
                     <tr style="border-bottom: 1px solid #374151;">
                         <td style="padding: 8px;">${user.radio_id}</td>
                         <td style="padding: 8px; font-weight: 500; color: ${user.callsign ? 'white' : '#6b7280'};">${callsign}</td>
                         <td style="padding: 8px;">${source}</td>
                         <td style="padding: 8px; text-align: center;">${user.slot}</td>
-                        <td style="padding: 8px;">${user.talkgroup}</td>
+                        <td style="padding: 8px;">${destination}</td>
                         <td style="padding: 8px; color: ${user.active ? '' : '#9ca3af'};">${timeDisplay}</td>
                     </tr>
                 `;

@@ -249,6 +249,14 @@ class HBProtocol(asyncio.DatagramProtocol):
         else:
             repeater.slot2_talkgroups = None
 
+        # Seed unit-call participation from the pattern default. RPTO may
+        # later override this with an explicit UNIT=true|false entry.
+        repeater.unit_calls_enabled = repeater_config.default_unit_calls
+        LOGGER.debug(
+            f'Repeater {rid_to_int(repeater_id)} unit calls '
+            f'{"ENABLED" if repeater.unit_calls_enabled else "DISABLED"} (pattern default)'
+        )
+
     # ========== OUTBOUND CONNECTION METHODS (Phase 3) ==========
     
     def _parse_options(self, options: str) -> Tuple[Optional[set], Optional[set]]:
@@ -681,7 +689,19 @@ class HBProtocol(asyncio.DatagramProtocol):
         src_id = packet['src_id_int']
         remote_repeater_id = packet['repeater_id_int']
         _is_terminator = self._is_dmr_terminator(data, _frame_type)
-        
+
+        # Unit (private) calls from an outbound link take a dedicated path:
+        # no TG ACL, no translation, RPF-style anti-loop (do not re-forward
+        # to any outbound). The cache is populated with `outbound_name` so
+        # any local user calling this subscriber routes back via this same
+        # link — building an implicit reverse-path forwarding tree when
+        # peers at both ends speak the same protocol.
+        if _call_type == 1:
+            self._handle_outbound_unit_call(
+                data, outbound_state, packet, _is_terminator, remote_repeater_id
+            )
+            return
+
         # Check if this talkgroup is allowed on this outbound connection
         allowed_tgs = outbound_state.slot1_talkgroups if _slot == 1 else outbound_state.slot2_talkgroups
         
@@ -848,7 +868,150 @@ class HBProtocol(asyncio.DatagramProtocol):
             LOGGER.debug(f'[{outbound_state.config.name}] Forwarded DMRD '
                         f'{ts_tg} src={src_id} to {forwarded_count} local repeater(s)')
 
-    
+
+    def _handle_outbound_unit_call(self, data: bytes, outbound_state: 'OutboundState',
+                                    packet: dict, is_terminator: bool,
+                                    remote_repeater_id: int) -> None:
+        """
+        Handle a unit (private) call arriving on an outbound link.
+
+        Flow mirrors `_handle_unit_stream_start` for local repeaters, but
+        stream state is tracked on the outbound connection's slot and the
+        user cache learns the source radio is reachable via this outbound.
+        Targets are computed with `source_outbound_name` set, which causes
+        `_calculate_unit_call_targets` to skip all outbound fanout
+        (anti-loop; peers handle their own side of the RPF tree).
+        """
+        conn_name = outbound_state.config.name
+
+        # Link-level gate: if this outbound isn't unit-enabled, drop.
+        if not outbound_state.config.unit_calls_enabled:
+            LOGGER.debug(
+                f'[{conn_name}] Unit call dropped — unit_calls_enabled=False on this outbound'
+            )
+            return
+
+        _rf_src = packet['rf_src']
+        _dst_id = packet['dst_id']
+        _slot = packet['slot']
+        _stream_id = packet['stream_id']
+        src_id = packet['src_id_int']
+        dst_int = packet['dst_id_int']
+
+        # Track RX stream state on the outbound slot. A new stream_id means
+        # a new transmission — create fresh state, evict any active assumed
+        # (TX) stream that happens to be on this slot (RX from the remote
+        # wins, same rule as group calls).
+        current_stream = outbound_state.get_slot_stream(_slot)
+        current_time = time()
+
+        if not current_stream or current_stream.stream_id != _stream_id:
+            if current_stream and current_stream.is_assumed and not current_stream.ended:
+                LOGGER.info(
+                    f'[{conn_name}] TS{_slot} TX stream cleared by incoming unit-call RX stream'
+                )
+                outbound_state.set_slot_stream(_slot, None)
+                self._active_calls -= 1
+
+            # Figure out forwarding targets BEFORE creating the stream so we
+            # can log target count alongside stream-start.
+            target_repeaters, is_broadcast = self._calculate_unit_call_targets(
+                source_repeater_id=None, slot=_slot,
+                rf_src=_rf_src, dst_id=_dst_id, stream_id=_stream_id,
+                source_outbound_name=conn_name,
+            )
+
+            dummy_id = outbound_state.config.radio_id.to_bytes(4, 'big')
+            new_stream = StreamState(
+                repeater_id=dummy_id,
+                rf_src=_rf_src,
+                dst_id=_dst_id,
+                slot=_slot,
+                start_time=current_time,
+                last_seen=current_time,
+                stream_id=_stream_id,
+                packet_count=1,
+                call_type="private",
+                is_assumed=False,  # Real RX from the remote
+                is_unit_call=True,
+                is_broadcast_unit_call=is_broadcast,
+                target_repeaters=target_repeaters,
+                routing_cached=True,
+            )
+            outbound_state.set_slot_stream(_slot, new_stream)
+
+            # Dashboard event
+            self._emit_stream_start(
+                'outbound',
+                conn_name,
+                _slot,
+                _rf_src,
+                _dst_id,
+                _stream_id,
+                'private',
+                False,
+                remote_repeater_id,
+            )
+
+            mode_tag = '[broadcast]' if is_broadcast else (
+                f'[one-to-one via {int.from_bytes(next(iter(target_repeaters)), "big")}]'
+                if target_repeaters else '[no eligible targets]'
+            )
+            LOGGER.info(
+                f'[{conn_name}] Unit RX stream started TS/RID: {_slot}/{dst_int} '
+                f'src={src_id} targets={len(target_repeaters)} '
+                f'stream_id={_stream_id.hex()} {mode_tag}'
+            )
+
+            # Cache the source radio as reachable via this outbound so local
+            # users calling it route back over this same link.
+            if self._user_cache:
+                self._user_cache.update(
+                    radio_id=src_id,
+                    repeater_id=0,
+                    callsign='',
+                    slot=_slot,
+                    talkgroup=dst_int,
+                    outbound_name=conn_name,
+                )
+        else:
+            current_stream.last_seen = current_time
+            current_stream.packet_count += 1
+
+        # Forward to each target. Unit calls never translate, so the packet
+        # goes out as-is. We still rewrite the repeater-id header field to
+        # the target repeater's id (existing downstream code expects it).
+        source_stream = outbound_state.get_slot_stream(_slot)
+        if source_stream is None:
+            return
+
+        for target in source_stream.target_repeaters or ():
+            if isinstance(target, tuple):
+                # Defensive: _calculate_unit_call_targets with a source
+                # outbound should never return outbound targets, but skip
+                # any that slip through.
+                continue
+            target_repeater_id = target
+            target_repeater = self._repeaters.get(target_repeater_id)
+            if not target_repeater:
+                continue
+            # No translation for unit calls — just forward the packet.
+            self._send_packet(data, target_repeater.sockaddr)
+            self._update_assumed_stream(
+                target_repeater, _slot, _rf_src, _dst_id, _stream_id,
+                is_terminator, remote_repeater_id,
+                is_unit_call=True,
+            )
+
+        # Handle terminator on the outbound side
+        if is_terminator and source_stream:
+            dummy_id = outbound_state.config.radio_id.to_bytes(4, 'big')
+            self._end_stream(source_stream, dummy_id, _slot, current_time, 'terminator')
+            self._emit_stream_end(
+                'outbound', conn_name, _slot, source_stream, 'terminator'
+            )
+
+
     # ========== END HELPER METHODS ==========
         
     def cleanup(self) -> None:
@@ -1007,28 +1170,35 @@ class HBProtocol(asyncio.DatagramProtocol):
         elif end_reason == 'fast_terminator':
             reason_text = f'reason=fast_terminator - entering hang time ({hang_time}s)'
         else:  # timeout
-            reason_text = f'entering hang time ({hang_time}s)'
+            reason_text = f'reason=timeout - entering hang time ({hang_time}s)'
         
         # Log stream end (DEBUG for TX, INFO for RX). Match stream-start
-        # format, including net/rf translation annotation when the repeater
-        # has an inbound_map that remaps (slot, dst_id) to a different
-        # network-side pair. For outbound-sourced streams repeater_id is a
-        # synthetic dummy that won't be in self._repeaters — we still log,
-        # just without translation annotation (nothing to annotate since
-        # outbound arrives already in network vocabulary).
+        # format. Group calls get net/rf translation annotation via fmt_ts_tg;
+        # unit (private) calls carry a subscriber ID in dst_id rather than a
+        # TGID, and never translate — format them as UNIT explicitly so the
+        # dst isn't misread as a talkgroup. For outbound-sourced streams
+        # repeater_id is a synthetic dummy that won't be in self._repeaters —
+        # we still log, just without translation annotation.
         rid_int = rid_to_int(repeater_id)
         src_int = int.from_bytes(stream.rf_src, "big")
-        repeater = self._repeaters.get(repeater_id)
-        if repeater and repeater.inbound_map:
-            net_slot, net_dst_id = repeater.inbound_map.get(
-                (slot, stream.dst_id), (slot, stream.dst_id)
-            )
-        else:
-            net_slot, net_dst_id = slot, stream.dst_id
-        ts_tg = fmt_ts_tg(net_slot, net_dst_id, slot, stream.dst_id)
-
+        dst_int = int.from_bytes(stream.dst_id, "big")
         log = LOGGER.debug if stream_type == "TX" else LOGGER.info
-        log(f'{stream_type} stream ended on repeater {rid_int} {ts_tg} '
+
+        if stream.is_unit_call:
+            call_type_prefix = "Unit"
+            ts_addr = f'TS/RID: {slot}/{dst_int}'
+        else:
+            call_type_prefix = "Group"
+            repeater = self._repeaters.get(repeater_id)
+            if repeater and repeater.inbound_map:
+                net_slot, net_dst_id = repeater.inbound_map.get(
+                    (slot, stream.dst_id), (slot, stream.dst_id)
+                )
+            else:
+                net_slot, net_dst_id = slot, stream.dst_id
+            ts_addr = fmt_ts_tg(net_slot, net_dst_id, slot, stream.dst_id)
+
+        log(f'{call_type_prefix} {stream_type} stream ended on repeater {rid_int} {ts_addr} '
             f'src={src_int} duration={duration:.2f}s '
             f'packets={stream.packet_count} {reason_text}')
         
@@ -1402,58 +1572,79 @@ class HBProtocol(asyncio.DatagramProtocol):
         # O(1) set membership check with no bytes→int conversion!
         return dst_id in allowed_tgids
     
-    def _is_slot_busy(self, repeater_id: bytes, slot: int, stream_id: bytes, 
-                     rf_src: bytes = None, dst_id: bytes = None) -> bool:
+    def _is_slot_busy(self, repeater_id: bytes, slot: int, stream_id: bytes,
+                     rf_src: bytes = None, dst_id: bytes = None,
+                     is_unit_call: bool = False) -> bool:
         """
         Check if a slot is busy with a different stream (contention check).
-        
+
+        Hang-time semantics depend on call type:
+          - Group call: slot is reserved for the TALKGROUP conversation — any
+            user on the same TG may continue, OR the original source may
+            switch to a different TG (fast TG switch). Anything else is a
+            hijack and the slot reads busy.
+          - Unit call: slot is reserved for the SUBSCRIBER PAIR — either
+            direction of the same A↔B pair may continue, OR the original
+            source may start a new unit call to a different target.
+            Anything else is a hijack and the slot reads busy.
+        These semantics are applied only when the current stream matches the
+        incoming call's type. Cross-type (group-in-hangtime + incoming unit,
+        or vice versa) always reads busy — we don't mix the two vocabularies.
+
         Args:
             repeater_id: Repeater ID to check
             slot: Timeslot to check
             stream_id: Current stream ID (to allow same stream through)
             rf_src: Source subscriber ID (optional, for hang time check)
-            dst_id: Destination TGID (optional, for hang time check)
-            
+            dst_id: Destination TGID or target radio ID (optional, for hang time check)
+            is_unit_call: True when the incoming call is a unit (private) call
+
         Returns:
             True if slot is busy with different stream, False if available
         """
         repeater = self._repeaters.get(repeater_id)
         if not repeater:
             return False
-        
+
         # Get the slot's current stream
         current_stream = repeater.get_slot_stream(slot)
         if not current_stream:
             return False  # No stream, slot is free
-        
+
         # Check if it's the same stream
         if current_stream.stream_id == stream_id:
             return False  # Same stream, not busy
-        
+
         # Check if stream has ended and is in hang time
         current_time = time()
         hang_time = CONFIG.get('global', {}).get('stream_hang_time', 10.0)
-        
+
         if current_stream.end_time:
             # Stream has ended, check hang time
             time_since_end = current_time - current_stream.end_time
             if time_since_end > hang_time:
                 return False  # Hang time expired, slot is free
-            
-            # Still in hang time - hang time protects the TALKGROUP conversation
-            # Allow: 1) Any user on same talkgroup (conversation continues)
-            #        2) Original user switching to different talkgroup (special case)
-            # Block: Different user trying to use different talkgroup (hijacking)
+
+            # Still in hang time — apply the appropriate hijack rules.
             if rf_src and dst_id:
-                # Same user can always break through (any talkgroup)
-                if current_stream.rf_src == rf_src:
-                    return False  # Same user, allow through
-                # Different user - check if same talkgroup
-                if current_stream.dst_id == dst_id:
-                    return False  # Different user, but same TG conversation - allow
-                # Different user AND different talkgroup = blocked
-                # This is the hijacking case we prevent
-        
+                if is_unit_call and current_stream.is_unit_call:
+                    # Subscriber-pair semantics: either direction of same pair,
+                    # or same source calling a different target, passes through.
+                    same_pair = (
+                        (current_stream.rf_src == rf_src and current_stream.dst_id == dst_id)
+                        or (current_stream.rf_src == dst_id and current_stream.dst_id == rf_src)
+                    )
+                    same_src = (current_stream.rf_src == rf_src)
+                    if same_pair or same_src:
+                        return False
+                elif not is_unit_call and not current_stream.is_unit_call:
+                    # Group-call hang time: protect the TG conversation.
+                    if current_stream.rf_src == rf_src:
+                        return False  # Same user, allow through (TG switch)
+                    if current_stream.dst_id == dst_id:
+                        return False  # Same TG, different user — allow
+                # Cross-type or mismatch — fall through, slot reads busy.
+
         # Slot is busy with a different active stream or protected by hang time
         return True
 
@@ -1594,14 +1785,11 @@ class HBProtocol(asyncio.DatagramProtocol):
         Handle the start of a new stream on a repeater slot.
         Returns True if the stream can proceed, False if there's a contention.
         """
-        # Check if this is a unit/private call (call_type_bit == 1)
+        # Unit (private) calls take a dedicated path: separate routing (user
+        # cache lookup with broadcast fallback), subscriber-pair hang-time
+        # semantics, no TG access control, no DMRD translation.
         if call_type_bit == 1:
-            # Unit calls address an individual radio ID rather than a talkgroup,
-            # and are never translated — no net/rf split to display.
-            LOGGER.info(f'UNIT CALL received on repeater {rid_to_int(repeater.repeater_id)} '
-                       f'TS/RID: {slot}/{bytes_to_int(dst_id)} src={bytes_to_int(rf_src)} '
-                       f'stream_id={stream_id.hex()} [NOT ROUTED - unit call handling not yet implemented]')
-            return False  # Reject the stream - don't process unit calls yet
+            return self._handle_unit_stream_start(repeater, rf_src, dst_id, slot, stream_id)
         
         current_stream = repeater.get_slot_stream(slot)
         current_time = time()
@@ -1773,14 +1961,12 @@ class HBProtocol(asyncio.DatagramProtocol):
         
         # Log stream start with fast talkgroup switch indicator and target count
         ts_tg = fmt_ts_tg(net_slot, net_dst_id, slot, dst_id)
-        if fast_tg_switch:
-            LOGGER.info(f'RX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
-                       f'src={bytes_to_int(rf_src)} stream_id={stream_id.hex()} '
-                       f'targets={len(target_repeaters)} [FAST TG SWITCH]')
-        else:
-            LOGGER.info(f'RX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
-                       f'src={bytes_to_int(rf_src)} stream_id={stream_id.hex()} '
-                       f'targets={len(target_repeaters)}')
+        fast_tag = ' [FAST TG SWITCH]' if fast_tg_switch else ''
+        LOGGER.info(
+            f'Group RX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
+            f'src={bytes_to_int(rf_src)} targets={len(target_repeaters)} '
+            f'stream_id={stream_id.hex()}{fast_tag}'
+        )
         
         # Emit stream_start event
         self._emit_stream_start(
@@ -1806,9 +1992,293 @@ class HBProtocol(asyncio.DatagramProtocol):
                 slot=slot,
                 talkgroup=dst
             )
-        
+
         return True
-    
+
+    def _handle_unit_stream_start(self, repeater: RepeaterState, rf_src: bytes,
+                                   dst_id: bytes, slot: int, stream_id: bytes) -> bool:
+        """
+        Handle the start of a unit (private) call on a repeater slot.
+
+        Unit calls are subscriber-to-subscriber: dst_id holds the target radio
+        ID rather than a TGID. Routing uses the user cache; if the target isn't
+        known we broadcast to every unit-enabled repeater and let Phase-3
+        pruning collapse to one-to-one on the first reply (not implemented
+        yet — today broadcasts just persist for the call).
+
+        Slot model is ships-in-the-night: we always forward on the source's
+        originating slot regardless of where the target was last heard.
+
+        Hang-time / contention are keyed on the (rf_src, dst_id) subscriber
+        pair rather than the talkgroup. Either direction of the same pair
+        (A→B or B→A) counts as the same conversation; the same source making
+        a new call to a different target is also allowed (like a fast TG
+        switch). Anything else during hang time is a hijack and denied.
+
+        Returns True if the stream was accepted and routing cached, False to
+        reject the call.
+        """
+        rid_int = rid_to_int(repeater.repeater_id)
+        src_int = bytes_to_int(rf_src)
+        dst_int = bytes_to_int(dst_id)
+
+        # Gate at the source: repeater must be enabled for unit calls.
+        if not repeater.unit_calls_enabled:
+            LOGGER.info(
+                f'UNIT CALL rejected on repeater {rid_int} TS{slot}: '
+                f'src={src_int} → dst={dst_int} stream_id={stream_id.hex()} '
+                f'[repeater has unit_calls_enabled=False]'
+            )
+            return False
+
+        current_stream = repeater.get_slot_stream(slot)
+        current_time = time()
+
+        if current_stream:
+            # Same stream continuing
+            if current_stream.stream_id == stream_id:
+                return True
+
+            if current_stream.ended:
+                # Hang time — subscriber-pair semantics for unit calls, TG
+                # semantics for a prior group call. When the prior stream was a
+                # group call and this is a unit call, the slot was reserved for
+                # TG conversation: we treat anything other than the same rf_src
+                # as a hijack.
+                if current_stream.is_unit_call:
+                    same_pair = (
+                        (current_stream.rf_src == rf_src and current_stream.dst_id == dst_id)
+                        or (current_stream.rf_src == dst_id and current_stream.dst_id == rf_src)
+                    )
+                    same_src = (current_stream.rf_src == rf_src)
+                    if not (same_pair or same_src):
+                        LOGGER.warning(
+                            f'UNIT CALL hang-time hijack blocked on repeater {rid_int} TS{slot}: '
+                            f'slot reserved for {bytes_to_int(current_stream.rf_src)}↔'
+                            f'{bytes_to_int(current_stream.dst_id)}, '
+                            f'denied src={src_int} → dst={dst_int}'
+                        )
+                        return False
+                else:
+                    # Prior stream was a group call; only same source can break through
+                    if current_stream.rf_src != rf_src:
+                        LOGGER.warning(
+                            f'UNIT CALL hang-time hijack blocked on repeater {rid_int} TS{slot}: '
+                            f'slot in group-call hang time, denied src={src_int} → dst={dst_int}'
+                        )
+                        return False
+                # fall through to create new stream
+            else:
+                # Active stream on this slot — contention, first come wins.
+                LOGGER.warning(
+                    f'UNIT CALL contention on repeater {rid_int} TS{slot}: '
+                    f'existing stream_id={current_stream.stream_id.hex()} '
+                    f'vs new src={src_int} → dst={dst_int} stream_id={stream_id.hex()}'
+                )
+                return False
+
+        # Calculate forwarding targets.
+        target_repeaters, is_broadcast = self._calculate_unit_call_targets(
+            repeater.repeater_id, slot, rf_src, dst_id, stream_id
+        )
+
+        new_stream = StreamState(
+            repeater_id=repeater.repeater_id,
+            rf_src=rf_src,
+            dst_id=dst_id,
+            slot=slot,
+            start_time=current_time,
+            last_seen=current_time,
+            stream_id=stream_id,
+            packet_count=1,
+            call_type="private",
+            target_repeaters=target_repeaters,
+            routing_cached=True,
+            is_unit_call=True,
+            is_broadcast_unit_call=is_broadcast,
+        )
+        repeater.set_slot_stream(slot, new_stream)
+
+        # Start-of-stream line mirrors the group-call format but with TS/RID in
+        # place of TS/TGID and a mode annotation (one-to-one / broadcast /
+        # no-targets), plus a cross-slot note when the target was last heard
+        # on a different slot than we're forwarding on.
+        if is_broadcast:
+            mode_tag = '[broadcast]'
+        elif target_repeaters:
+            target_id = next(iter(target_repeaters))
+            target_int = int.from_bytes(target_id, 'big') if isinstance(target_id, bytes) else target_id
+            cross_slot = ''
+            if self._user_cache:
+                entry = self._user_cache.lookup(dst_int)
+                if entry and entry.slot != slot:
+                    cross_slot = ', cross-slot'
+            mode_tag = f'[one-to-one via {target_int}{cross_slot}]'
+        else:
+            mode_tag = '[no eligible targets]'
+
+        LOGGER.info(
+            f'Unit RX stream started on repeater {rid_int} TS/RID: {slot}/{dst_int} '
+            f'src={src_int} targets={len(target_repeaters)} '
+            f'stream_id={stream_id.hex()} {mode_tag}'
+        )
+
+        self._emit_stream_start(
+            'repeater',
+            rid_int,
+            slot,
+            rf_src,
+            dst_id,
+            stream_id,
+            'private',
+            False,
+        )
+
+        # Populate user cache for the source radio. Same call shape as the
+        # group-call path; `talkgroup` field holds dst_id here (target radio
+        # ID for unit calls), which the dashboard can display as a "called"
+        # indicator if it chooses.
+        if self._user_cache:
+            self._user_cache.update(
+                radio_id=src_int,
+                repeater_id=rid_int,
+                callsign='',
+                slot=slot,
+                talkgroup=dst_int,
+            )
+
+        return True
+
+    def _calculate_unit_call_targets(self, source_repeater_id: Optional[bytes], slot: int,
+                                      rf_src: bytes, dst_id: bytes, stream_id: bytes,
+                                      source_outbound_name: Optional[str] = None) -> Tuple[set, bool]:
+        """
+        Build the target set for a unit call.
+
+        Cache hit and cached endpoint eligible → one-to-one target set
+        containing a single element: a `repeater_id` (bytes) for local
+        repeaters or `('outbound', name)` for outbound connections.
+        Cache miss (or cached endpoint ineligible) → broadcast to every
+        unit-enabled, connected endpoint (local repeaters + outbound links)
+        with the originating slot free, excluding the source endpoint.
+
+        Slot model is ships-in-the-night: we always forward on the source's
+        originating slot; the target's last-heard slot is informational only.
+
+        Anti-loop: unit calls that arrived from an outbound connection are
+        never re-forwarded to any outbound (including the source) — each
+        HBlink4 peer owns fanout within its own network, which yields an
+        RPF-style tree when both ends speak the same protocol.
+
+        Args:
+            source_repeater_id: Local repeater that sourced the call (bytes),
+                or None when the call arrived via an outbound link.
+            source_outbound_name: Outbound connection name when the call
+                arrived via that link, or None for local-repeater sources.
+                Exactly one of source_repeater_id / source_outbound_name
+                must be set.
+
+        Returns:
+            (target_set, is_broadcast)
+        """
+        dst_int = bytes_to_int(dst_id)
+        from_outbound = source_outbound_name is not None
+
+        # Cache hit path
+        if self._user_cache:
+            source = self._user_cache.get_source_for_user(dst_int)
+            if source is not None:
+                kind, ident = source
+                if kind == 'local':
+                    cached_repeater_id = ident.to_bytes(4, 'big')
+                    if cached_repeater_id != source_repeater_id:
+                        target_repeater = self._repeaters.get(cached_repeater_id)
+                        if (target_repeater
+                                and target_repeater.connection_state == 'connected'
+                                and target_repeater.unit_calls_enabled
+                                and not self._is_slot_busy(cached_repeater_id, slot, stream_id,
+                                                           rf_src, dst_id, is_unit_call=True)):
+                            return ({cached_repeater_id}, False)
+                elif kind == 'outbound' and not from_outbound:
+                    # Local sources may route to a cached outbound target;
+                    # outbound sources never forward to another outbound.
+                    outbound = self._outbounds.get(ident)
+                    if (outbound is not None
+                            and outbound.authenticated
+                            and outbound.config.unit_calls_enabled
+                            and not self._is_outbound_slot_busy(outbound, slot, stream_id,
+                                                                rf_src, dst_id, is_unit_call=True)):
+                        return ({('outbound', ident)}, False)
+                # Cache hit but target ineligible (or cross-outbound forwarding
+                # suppressed) — fall through to broadcast.
+
+        # Broadcast path: every unit-enabled local repeater except source,
+        # plus every unit-enabled outbound except source when call originated
+        # locally. Unit calls sourced from an outbound only broadcast to
+        # local repeaters (anti-loop).
+        target_set: set = set()
+        for target_id, target_repeater in self._repeaters.items():
+            if target_id == source_repeater_id:
+                continue
+            if target_repeater.connection_state != 'connected':
+                continue
+            if not target_repeater.unit_calls_enabled:
+                continue
+            if self._is_slot_busy(target_id, slot, stream_id, rf_src, dst_id, is_unit_call=True):
+                continue
+            target_set.add(target_id)
+
+        if not from_outbound:
+            for conn_name, outbound in self._outbounds.items():
+                if not outbound.authenticated:
+                    continue
+                if not outbound.config.unit_calls_enabled:
+                    continue
+                if self._is_outbound_slot_busy(outbound, slot, stream_id,
+                                               rf_src, dst_id, is_unit_call=True):
+                    continue
+                target_set.add(('outbound', conn_name))
+
+        return (target_set, True)
+
+    def _is_outbound_slot_busy(self, outbound: 'OutboundState', slot: int, stream_id: bytes,
+                                rf_src: bytes, dst_id: bytes,
+                                is_unit_call: bool = False) -> bool:
+        """
+        Parallel of `_is_slot_busy` for outbound connections.
+
+        Outbound connections track their own per-slot stream state and do
+        not pass through the same hang-time helpers; this applies the unit-
+        call subscriber-pair hang-time semantics and the group-call TG
+        hang-time semantics the same way `_is_slot_busy` does for local
+        repeaters.
+        """
+        current_stream = outbound.get_slot_stream(slot)
+        if not current_stream:
+            return False
+        if current_stream.stream_id == stream_id:
+            return False
+
+        current_time = time()
+        hang_time = CONFIG.get('global', {}).get('stream_hang_time', 10.0)
+        if current_stream.end_time:
+            if (current_time - current_stream.end_time) > hang_time:
+                return False
+            if is_unit_call and current_stream.is_unit_call:
+                same_pair = (
+                    (current_stream.rf_src == rf_src and current_stream.dst_id == dst_id)
+                    or (current_stream.rf_src == dst_id and current_stream.dst_id == rf_src)
+                )
+                same_src = (current_stream.rf_src == rf_src)
+                if same_pair or same_src:
+                    return False
+            elif not is_unit_call and not current_stream.is_unit_call:
+                if current_stream.rf_src == rf_src:
+                    return False
+                if current_stream.dst_id == dst_id:
+                    return False
+        return True
+
     def _handle_stream_packet(self, repeater: RepeaterState, rf_src: bytes, dst_id: bytes,
                               slot: int, stream_id: bytes, call_type_bit: int = 1) -> bool:
         """
@@ -2297,10 +2767,13 @@ class HBProtocol(asyncio.DatagramProtocol):
             # Parse RPTO: TS1=.../TS2=... can hold translation syntax per entry.
             # SRC= declares a single rf_src override applied to every group-voice
             # packet forwarded out of this repeater (one-way).
+            # UNIT=true|false declares whether this repeater participates in
+            # unit (private) call routing; absent = keep pattern default.
             requested_ts1: Set[bytes] = set()
             requested_ts2: Set[bytes] = set()
             translations: List[Tuple[int, bytes, int, bytes, int]] = []
             tx_src_override: Optional[bytes] = None
+            unit_calls_override: Optional[bool] = None
             saw_translation_syntax = False
 
             for part in options_str.split(';'):
@@ -2346,6 +2819,26 @@ class HBProtocol(asyncio.DatagramProtocol):
                             f'⚠️  RPTO SRC parse error from repeater '
                             f'{rid_to_int(repeater_id)}: "{value}" ({e})'
                         )
+                elif key == 'UNIT':
+                    v = value.lower()
+                    if v in ('true', '1', 'yes', 'on'):
+                        unit_calls_override = True
+                    elif v in ('false', '0', 'no', 'off'):
+                        unit_calls_override = False
+                    else:
+                        LOGGER.warning(
+                            f'⚠️  RPTO UNIT parse error from repeater '
+                            f'{rid_to_int(repeater_id)}: "{value}" (expected true/false)'
+                        )
+                        continue
+                    # UNIT= override is honored only for trusted repeaters.
+                    # Untrusted repeaters stay on the pattern default.
+                    if not repeater_config.trust:
+                        LOGGER.warning(
+                            f'⚠️  Repeater {rid_to_int(repeater_id)} sent UNIT={value} '
+                            f'but is not trusted — override ignored, pattern default used'
+                        )
+                        unit_calls_override = None
             
             # Check if this repeater is trusted
             if repeater_config.trust:
@@ -2405,6 +2898,20 @@ class HBProtocol(asyncio.DatagramProtocol):
             repeater.slot1_talkgroups = final_ts1
             repeater.slot2_talkgroups = final_ts2
             repeater.rpto_received = True  # Mark that RPTO was received
+
+            # UNIT= is a full replacement like TGs and SRC: absent UNIT reverts
+            # to the pattern default, present UNIT overrides it for this repeater.
+            new_unit_enabled = (
+                unit_calls_override if unit_calls_override is not None
+                else repeater_config.default_unit_calls
+            )
+            if new_unit_enabled != repeater.unit_calls_enabled:
+                repeater.unit_calls_enabled = new_unit_enabled
+                LOGGER.info(
+                    f'  → Unit calls {"ENABLED" if new_unit_enabled else "DISABLED"} '
+                    f'on repeater {rid_to_int(repeater_id)}'
+                    f'{" (RPTO override)" if unit_calls_override is not None else " (pattern default)"}'
+                )
 
             # Build translation maps. Only trusted repeaters may declare remaps
             # or rf_src override; untrusted repeaters get translation syntax
@@ -2837,7 +3344,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 # We must track what we're transmitting on each timeslot
                 self._update_assumed_stream_outbound(outbound, net_slot, net_rf_src, net_dst_id,
                                                     stream_id, is_terminator,
-                                                    int.from_bytes(source_repeater_id, 'big'))
+                                                    int.from_bytes(source_repeater_id, 'big'),
+                                                    is_unit_call=source_stream.is_unit_call)
 
             else:
                 # Target is a local repeater (bytes)
@@ -2871,7 +3379,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 self._update_assumed_stream(target_repeater, out_slot, net_rf_src, out_dst,
                                            stream_id, is_terminator,
                                            int.from_bytes(source_repeater_id, 'big'),
-                                           net_slot=net_slot, net_dst_id=net_dst_id)
+                                           net_slot=net_slot, net_dst_id=net_dst_id,
+                                           is_unit_call=source_stream.is_unit_call)
     
     # ================================
     # DMR Packet Processing
@@ -2958,7 +3467,8 @@ class HBProtocol(asyncio.DatagramProtocol):
     def _update_assumed_stream(self, repeater: RepeaterState, slot: int, rf_src: bytes,
                               dst_id: bytes, stream_id: bytes, is_terminator: bool,
                               source_repeater_id: int,
-                              net_slot: int = None, net_dst_id: bytes = None) -> None:
+                              net_slot: int = None, net_dst_id: bytes = None,
+                              is_unit_call: bool = False) -> None:
         """
         Update or create assumed stream state on a target repeater.
 
@@ -2975,12 +3485,16 @@ class HBProtocol(asyncio.DatagramProtocol):
             source_repeater_id: ID of source repeater (for logging)
             net_slot: Network-side timeslot (for log annotation when translated)
             net_dst_id: Network-side TGID (for log annotation when translated)
+            is_unit_call: True if this is a unit (private) call — governs
+                hang-time semantics (subscriber pair) if a new stream arrives
+                on this slot after the assumed one ends.
         """
         current_stream = repeater.get_slot_stream(slot)
         current_time = time()
 
         if not current_stream or current_stream.stream_id != stream_id:
             # New assumed stream starting
+            call_type = "private" if is_unit_call else "group"
             new_stream = StreamState(
                 repeater_id=repeater.repeater_id,
                 rf_src=rf_src,
@@ -2990,18 +3504,26 @@ class HBProtocol(asyncio.DatagramProtocol):
                 last_seen=current_time,
                 stream_id=stream_id,
                 packet_count=1,
-                call_type="group",  # Assume group call for forwarded streams
-                is_assumed=True  # Mark as assumed stream
+                call_type=call_type,
+                is_assumed=True,
+                is_unit_call=is_unit_call,
             )
             repeater.set_slot_stream(slot, new_stream)
 
             # Log at DEBUG level - TX streams are noisy
-            ts_tg = fmt_ts_tg(net_slot if net_slot is not None else slot,
-                              net_dst_id if net_dst_id is not None else dst_id,
-                              slot, dst_id)
-            LOGGER.debug(f'TX stream started on repeater {rid_to_int(repeater.repeater_id)} {ts_tg} '
-                       f'from repeater {source_repeater_id} src={bytes_to_int(rf_src)}')
-            
+            if is_unit_call:
+                ts_addr = f'TS/RID: {slot}/{bytes_to_int(dst_id)}'
+                call_type_prefix = 'Unit'
+            else:
+                ts_addr = fmt_ts_tg(net_slot if net_slot is not None else slot,
+                                    net_dst_id if net_dst_id is not None else dst_id,
+                                    slot, dst_id)
+                call_type_prefix = 'Group'
+            LOGGER.debug(
+                f'{call_type_prefix} TX stream started on repeater {rid_to_int(repeater.repeater_id)} '
+                f'{ts_addr} from repeater {source_repeater_id} src={bytes_to_int(rf_src)}'
+            )
+
             # Emit stream_start event for repeater card display (but marked as assumed)
             # Dashboard will filter these from Recent Events log
             self._emit_stream_start(
@@ -3011,7 +3533,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 rf_src,
                 dst_id,
                 stream_id,
-                'group',
+                call_type,
                 True  # TX assumed stream
             )
             
@@ -3028,7 +3550,8 @@ class HBProtocol(asyncio.DatagramProtocol):
 
     def _update_assumed_stream_outbound(self, outbound: OutboundState, slot: int, rf_src: bytes,
                                        dst_id: bytes, stream_id: bytes, is_terminator: bool,
-                                       source_repeater_id: int) -> None:
+                                       source_repeater_id: int,
+                                       is_unit_call: bool = False) -> None:
         """
         Update or create assumed stream state on an outbound connection's TDMA slot.
         
@@ -3051,7 +3574,8 @@ class HBProtocol(asyncio.DatagramProtocol):
             # New assumed stream starting on this outbound timeslot
             # Use a dummy repeater_id for outbound streams (can't use bytes for outbound)
             dummy_id = outbound.config.radio_id.to_bytes(4, 'big')
-            
+            call_type = "private" if is_unit_call else "group"
+
             new_stream = StreamState(
                 repeater_id=dummy_id,  # Our ID when acting as repeater
                 rf_src=rf_src,
@@ -3061,11 +3585,12 @@ class HBProtocol(asyncio.DatagramProtocol):
                 last_seen=current_time,
                 stream_id=stream_id,
                 packet_count=1,
-                call_type="group",  # Assume group call for forwarded streams
-                is_assumed=True  # Mark as assumed stream (TX, not RX)
+                call_type=call_type,
+                is_assumed=True,  # Mark as assumed stream (TX, not RX)
+                is_unit_call=is_unit_call,
             )
             outbound.set_slot_stream(slot, new_stream)
-            
+
             # Emit stream_start event for dashboard (using outbound connection name as identifier)
             # Keep structure minimal and JSON-serializable (match repeater-style fields
             # where possible). Do NOT include UserEntry objects (callsign) here.
@@ -3076,7 +3601,7 @@ class HBProtocol(asyncio.DatagramProtocol):
                 rf_src,
                 dst_id,
                 stream_id,
-                'group',
+                call_type,
                 True  # TX assumed stream
             )
             
