@@ -1009,19 +1009,28 @@ class HBProtocol(asyncio.DatagramProtocol):
         else:  # timeout
             reason_text = f'entering hang time ({hang_time}s)'
         
-        # Log stream end (DEBUG for TX, INFO for RX)
+        # Log stream end (DEBUG for TX, INFO for RX). Match stream-start
+        # format, including net/rf translation annotation when the repeater
+        # has an inbound_map that remaps (slot, dst_id) to a different
+        # network-side pair. For outbound-sourced streams repeater_id is a
+        # synthetic dummy that won't be in self._repeaters — we still log,
+        # just without translation annotation (nothing to annotate since
+        # outbound arrives already in network vocabulary).
         rid_int = rid_to_int(repeater_id)
         src_int = int.from_bytes(stream.rf_src, "big")
-        dst_int = int.from_bytes(stream.dst_id, "big")
-        
-        if stream_type == "TX":
-            LOGGER.debug(f'{stream_type} stream ended on repeater {rid_int} slot {slot}: '
-                       f'src={src_int}, dst={dst_int}, '
-                       f'duration={duration:.2f}s, packets={stream.packet_count}, {reason_text}')
+        repeater = self._repeaters.get(repeater_id)
+        if repeater and repeater.inbound_map:
+            net_slot, net_dst_id = repeater.inbound_map.get(
+                (slot, stream.dst_id), (slot, stream.dst_id)
+            )
         else:
-            LOGGER.info(f'{stream_type} stream ended on repeater {rid_int} slot {slot}: '
-                       f'src={src_int}, dst={dst_int}, '
-                       f'duration={duration:.2f}s, packets={stream.packet_count}, {reason_text}')
+            net_slot, net_dst_id = slot, stream.dst_id
+        ts_tg = fmt_ts_tg(net_slot, net_dst_id, slot, stream.dst_id)
+
+        log = LOGGER.debug if stream_type == "TX" else LOGGER.info
+        log(f'{stream_type} stream ended on repeater {rid_int} {ts_tg} '
+            f'src={src_int} duration={duration:.2f}s '
+            f'packets={stream.packet_count} {reason_text}')
         
         # Emit stream_end event for repeater card display
         # Dashboard will filter TX streams (is_assumed=True) from Recent Events log
