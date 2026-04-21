@@ -19,11 +19,12 @@ HBlink4 focuses on being an efficient **endpoint network server** with the follo
 - Improved error handling and logging
 - JSON-based configuration
 - Enhanced repeater management
-- Built on Twisted framework for reliable async operation
+- Built on Python's `asyncio` for single-loop UDP I/O with no external framework dependency
 - **Tightly integrated web dashboard** - Real-time monitoring with modern look and feel (see [Dashboard Documentation](dashboard/README.md))
 - **Stream tracking with immediate DMR terminator detection (~60ms)**
 - **Real-time duration counter with 1-second updates**
 - **Two-tier stream end detection (immediate terminator + timeout fallback)**
+- **Per-repeater DMRD translation** - slot/TGID remap and outbound rf_src override declared via RPTO (see [DMRD Translation](docs/dmrd_translation.md))
 - **User routing cache for efficient private call routing**
 - Pattern-based repeater configuration and blacklisting
 - Per-slot transmission management
@@ -83,11 +84,17 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[Dashboard README](dashboard/README.md)** - Dashboard features and usage
 - **[Systemd Service Installation](SYSTEMD.md)** - Production deployment with automatic startup
 - **[Connecting Repeaters](docs/connecting_to_hblink4.md)** - How to connect repeaters to HBlink4
+- **[Call Routing](docs/routing.md)** - Inbound/outbound filtering, contention, and assumed slot state
+- **[DMRD Translation](docs/dmrd_translation.md)** - Per-repeater slot/TGID remap and rf_src override (RPTO extended syntax)
 - **[Stream Tracking](docs/stream_tracking.md)** - How DMR transmission streams are managed
+- **[Stream Tracking Diagrams](docs/stream_tracking_diagrams.md)** - Visual walkthrough of stream lifecycle and contention
 - **[Hang Time](docs/hang_time.md)** - Preventing conversation interruption
 - **[Protocol Specification](docs/protocol.md)** - HomeBrew DMR protocol details
 - **[Integration Guide](docs/integration.md)** - Using HBlink4 as a module
 - **[Logging](docs/logging.md)** - Log management and rotation
+- **[Roadmap / TODO](docs/TODO.md)** - Planned work (unit calls, performance monitoring, config UI)
+- **[OpenBridge Analysis](docs/OPENBRIDGE_ANALYSIS.md)** - Reference analysis for future OpenBridge support
+- **[Release Notes v4.7.0](docs/RELEASE_NOTES_v4.7.0.md)** - Current release — asyncio, DMRA, outbound connections, DMRD translation
 
 
 

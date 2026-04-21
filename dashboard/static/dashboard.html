@@ -390,6 +390,11 @@
         .repeater-meta-label.rpto-tgs {
             color: #60a5fa;
         }
+
+        .translated-tg {
+            color: #fbbf24;
+            cursor: help;
+        }
         
         /* Slot Display */
         .slots-container {
@@ -793,7 +798,10 @@
         </div>
         
         <!-- Last Heard Users (Last 10) -->
-        <h2 class="section-header" style="margin-top: 20px; margin-bottom: 10px;">Last Heard</h2>
+        <h2 class="section-header" style="margin-top: 20px; margin-bottom: 10px;">
+            Last Heard
+            <span id="userDbStatus" style="font-size: 0.55em; color: #9ca3af; font-weight: 400; margin-left: 10px;"></span>
+        </h2>
         <div class="card">
             <div style="overflow-x: auto;">
                 <table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
@@ -880,7 +888,8 @@
                 total_duration_today: 0,
                 retransmitted_calls: 0
             },
-            config: {}
+            config: {},
+            user_db_status: null
         };
         
         // Audio notification system
@@ -1026,16 +1035,18 @@
                     state.events = data.data.events;
                     state.stats = data.data.stats;
                     state.last_heard = data.data.last_heard || [];
-                    
+                    state.user_db_status = data.data.user_db_status || null;
+
                     // Update HBlink connection status
                     updateHBlinkStatus(data.data.hblink_connected || false);
-                    
+
                     updateRepeaters(state.repeaters);
                     updateOutbounds(state.outbounds);
                     updateStreams(state.streams);
                     updateEvents(state.events);
                     updateStats(state.stats, state.repeaters, state.streams);
                     updateLastHeard(state.last_heard);
+                    updateUserDbStatus(state.user_db_status);
                 } else if (data.type === 'hblink_status') {
                     // HBlink4 connection status changed
                     updateHBlinkStatus(data.data.connected);
@@ -1043,6 +1054,10 @@
                     // Midnight reset - update stats immediately
                     state.stats = data.data;
                     updateStats(state.stats, state.repeaters, state.streams);
+                } else if (data.type === 'user_db_status') {
+                    // User database refresh completed (success or failure)
+                    state.user_db_status = data.data;
+                    updateUserDbStatus(state.user_db_status);
                 } else {
                     // Process event immediately for real-time updates
                     processEventUpdate(data);
@@ -1394,6 +1409,47 @@
             renderConnectionGroup('unknown', 'unknownCount', groups.unknown, '❓');
         }
         
+        // Build per-RF-slot display arrays from net-side subscription + translations.
+        // Subscriptions and translations on the wire are in network vocabulary; the
+        // card shows the RF-side (what the radio user sees). Each TGID in the result
+        // has {tgid, translated, title}: translated TGs are colored gold and carry a
+        // hover tooltip pointing back to the net-side value.
+        function rfTgLists(netSlot1, netSlot2, translations) {
+            const netToRf = new Map();
+            (translations || []).forEach(t => {
+                // [rf_slot, rf_tgid, net_slot, net_tgid]
+                netToRf.set(`${t[2]}.${t[3]}`, { rf_slot: t[0], rf_tgid: t[1] });
+            });
+            const rf1 = [], rf2 = [];
+            function bucket(netSlot, tgs) {
+                if (!Array.isArray(tgs)) return;
+                tgs.forEach(tg => {
+                    const xlate = netToRf.get(`${netSlot}.${tg}`);
+                    if (xlate) {
+                        const entry = {
+                            tgid: xlate.rf_tgid,
+                            translated: true,
+                            title: `Net TS${netSlot}/TG${tg}`
+                        };
+                        (xlate.rf_slot === 1 ? rf1 : rf2).push(entry);
+                    } else {
+                        const entry = { tgid: tg, translated: false, title: '' };
+                        (netSlot === 1 ? rf1 : rf2).push(entry);
+                    }
+                });
+            }
+            bucket(1, netSlot1);
+            bucket(2, netSlot2);
+            return { rf1, rf2 };
+        }
+
+        function renderTgChips(entries) {
+            return entries.map(e => e.translated
+                ? `<span class="translated-tg" title="${e.title}">${e.tgid}</span>`
+                : `${e.tgid}`
+            ).join(', ');
+        }
+
         function renderConnectionGroup(sectionName, countId, connections, icon) {
             const section = document.getElementById(`${sectionName}Section`);
             const container = document.getElementById(`${sectionName}Container`);
@@ -1430,12 +1486,16 @@
                 const connectedDuration = r.connected_at ? formatDuration(Date.now() / 1000 - r.connected_at) : '—';
                 const hasMissedPings = r.missed_pings > 0;
                 const headerClass = hasMissedPings ? 'repeater-header-warning' : 'repeater-header';
-                
+                const hasTranslations = Array.isArray(r.translations) && r.translations.length > 0;
+                const xlateTitle = hasTranslations ? `${r.translations.length} translation rule(s) active — translated TGs are shown in gold` : '';
+                const xlateBadge = hasTranslations ? `<span title="${xlateTitle}">🔀</span> ` : '';
+                const { rf1, rf2 } = rfTgLists(r.slot1_talkgroups, r.slot2_talkgroups, r.translations);
+
                 return `
                     <div class="repeater-card" data-repeater-id="${r.repeater_id}">
                         <div class="repeater-info">
                             <div class="${headerClass}" onclick="showRepeaterDetails(${r.repeater_id})" title="Click for detailed information">
-                                ${icon} ${r.callsign || 'Unknown'} (${r.repeater_id})
+                                ${icon} ${xlateBadge}${r.callsign || 'Unknown'} (${r.repeater_id})
                             </div>
                             <div class="repeater-meta">
                                 <!-- Row 1: Location / TX / TS1 -->
@@ -1453,18 +1513,23 @@
                                     <span class="repeater-meta-label">TS1 TGs:</span>
                                     <span>All</span>
                                 </div>
-                                ` : Array.isArray(r.slot1_talkgroups) && r.slot1_talkgroups.length === 0 ? `
+                                ` : Array.isArray(r.slot1_talkgroups) && r.slot1_talkgroups.length === 0 && rf1.length === 0 ? `
                                 <div class="repeater-meta-item" title="All talkgroups denied (empty configuration)">
                                     <span class="repeater-meta-label">TS1 TGs:</span>
                                     <span>None</span>
                                 </div>
-                                ` : Array.isArray(r.slot1_talkgroups) && r.slot1_talkgroups.length > 0 ? `
+                                ` : rf1.length > 0 ? `
                                 <div class="repeater-meta-item" ${r.rpto_received ? 'title="TGs supplied by repeater via RPTO"' : ''}>
                                     <span class="repeater-meta-label ${r.rpto_received ? 'rpto-tgs' : ''}">TS1 TGs:</span>
-                                    <span>${r.slot1_talkgroups.join(', ')}</span>
+                                    <span>${renderTgChips(rf1)}</span>
                                 </div>
-                                ` : '<div></div>'}
-                                
+                                ` : `
+                                <div class="repeater-meta-item">
+                                    <span class="repeater-meta-label">TS1 TGs:</span>
+                                    <span>None</span>
+                                </div>
+                                `}
+
                                 <!-- Row 2: Connected / RX / TS2 -->
                                 <div class="repeater-meta-item">
                                     <span class="repeater-meta-label">Connected:</span>
@@ -1481,17 +1546,22 @@
                                     <span class="repeater-meta-label">TS2 TGs:</span>
                                     <span>All</span>
                                 </div>
-                                ` : Array.isArray(r.slot2_talkgroups) && r.slot2_talkgroups.length === 0 ? `
+                                ` : Array.isArray(r.slot2_talkgroups) && r.slot2_talkgroups.length === 0 && rf2.length === 0 ? `
                                 <div class="repeater-meta-item" title="All talkgroups denied (empty configuration)">
                                     <span class="repeater-meta-label">TS2 TGs:</span>
                                     <span>None</span>
                                 </div>
-                                ` : Array.isArray(r.slot2_talkgroups) && r.slot2_talkgroups.length > 0 ? `
+                                ` : rf2.length > 0 ? `
                                 <div class="repeater-meta-item" ${r.rpto_received ? 'title="TGs supplied by repeater via RPTO"' : ''}>
                                     <span class="repeater-meta-label ${r.rpto_received ? 'rpto-tgs' : ''}">TS2 TGs:</span>
-                                    <span>${r.slot2_talkgroups.join(', ')}</span>
+                                    <span>${renderTgChips(rf2)}</span>
                                 </div>
-                                ` : '<div></div>'}
+                                ` : `
+                                <div class="repeater-meta-item">
+                                    <span class="repeater-meta-label">TS2 TGs:</span>
+                                    <span>None</span>
+                                </div>
+                                `}
                             </div>
                         </div>
                         
@@ -1812,6 +1882,49 @@
             }).join('');
         }
         
+        function updateUserDbStatus(status) {
+            const el = document.getElementById('userDbStatus');
+            if (!el) return;
+            if (!status) { el.textContent = ''; el.title = ''; return; }
+
+            const rows = status.loaded_rows || 0;
+            const ts = status.refresh_timestamp || 0;
+            const srcStatus = status.source_status || 'unknown';
+
+            let ageStr;
+            if (!ts) {
+                ageStr = 'never refreshed';
+            } else {
+                const elapsed = Math.floor(Date.now() / 1000 - ts);
+                if (elapsed < 60) ageStr = `${elapsed}s ago`;
+                else if (elapsed < 3600) ageStr = `${Math.floor(elapsed / 60)}m ago`;
+                else if (elapsed < 86400) ageStr = `${Math.floor(elapsed / 3600)}h ago`;
+                else ageStr = `${Math.floor(elapsed / 86400)}d ago`;
+            }
+
+            let color = '#9ca3af';
+            if (srcStatus === 'error') color = '#fbbf24';            // gold, matches other warnings
+            else if (srcStatus === 'not_modified' || srcStatus === 'ok') color = '#9ca3af';
+
+            el.style.color = color;
+            el.textContent = `Callsign DB: ${rows.toLocaleString()} entries, updated ${ageStr}`;
+
+            // Verbose hover so operators can diagnose without digging into logs.
+            const parts = [
+                `Source: ${status.source_url || '(unset)'}`,
+                `Status: ${srcStatus}`,
+                `Rows: ${rows.toLocaleString()}`
+            ];
+            if (status.last_modified_header) parts.push(`Upstream Last-Modified: ${status.last_modified_header}`);
+            if (status.last_error) parts.push(`Last error: ${status.last_error}`);
+            el.title = parts.join('\n');
+        }
+
+        // Re-tick the age string every 60s so it stays fresh between pushes.
+        setInterval(() => {
+            if (state.user_db_status) updateUserDbStatus(state.user_db_status);
+        }, 60000);
+
         function updateLastHeard(users) {
             const tbody = document.getElementById('lastHeardTable');
             
@@ -1826,6 +1939,11 @@
                 return;
             }
             
+            // Build id-keyed lookup for translation check (state.repeaters is an array).
+            const repeaterList = Array.isArray(state.repeaters) ? state.repeaters : Object.values(state.repeaters || {});
+            const repeaterById = {};
+            repeaterList.forEach(r => { if (r && r.repeater_id != null) repeaterById[r.repeater_id] = r; });
+
             // Dashboard maintains its own list of last 10 users
             tbody.innerHTML = users.map(user => {
                 const lastHeardDate = new Date(user.last_heard * 1000);
@@ -1862,8 +1980,17 @@
                 }
                 
                 const callsign = user.callsign || '-';
-                // Use source_name if available, fall back to repeater_id for backward compatibility
-                const source = user.source_name || user.repeater_id || '-';
+                // Use source_name if available, fall back to repeater_id for backward compatibility.
+                // Flag only if THIS specific transmission's (slot, talkgroup) matched a translation rule
+                // on the source repeater — not just "source has any rules".
+                const srcRepeater = user.source_repeater_id != null ? repeaterById[user.source_repeater_id] : null;
+                const xlate = srcRepeater && Array.isArray(srcRepeater.translations)
+                    ? srcRepeater.translations.find(t => t[0] === user.slot && t[1] === user.talkgroup)
+                    : null;
+                const srcXlateEmoji = xlate
+                    ? ` <span title="Translated: RF TS${xlate[0]}/TG${xlate[1]} ↔ Net TS${xlate[2]}/TG${xlate[3]}">🔀</span>`
+                    : '';
+                const source = (user.source_name || user.repeater_id || '-') + srcXlateEmoji;
                 
                 return `
                     <tr style="border-bottom: 1px solid #374151;">

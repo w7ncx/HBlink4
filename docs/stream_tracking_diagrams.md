@@ -955,4 +955,4 @@ Result: HBlink4 can scale to large networks while maintaining excellent
 
 **Document Version**: 2.0  
 **Last Updated**: October 2025  
-**Corresponding Code**: HBlink4 v1.5+
+**Corresponding Code**: HBlink4 v4.5+

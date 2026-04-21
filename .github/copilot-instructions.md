@@ -7,6 +7,8 @@ HBlink4 is a DMR Server implementing the HomeBrew protocol for amateur radio rep
 - **Core server** (`hblink4/`): Asyncio-based UDP server handling DMR protocol, stream tracking, and access control
 - **Web dashboard** (`dashboard/`): FastAPI-based real-time monitoring with WebSocket updates
 
+This project should always focus on efficiency and low-latency handling of DMR streams, what we call the "hot path". Additionally, ensuring that the dashboard does not consume resources in a way that negatively impacts the hot path or greatly increases system resource consumption. The low-end target system should be a modern Raspberry Pi or equivalent.
+
 ## Architecture Patterns
 
 ### Component Structure

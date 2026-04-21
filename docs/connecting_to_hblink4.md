@@ -16,22 +16,21 @@ To connect to an HBlink4 server, you need:
 
 ## Repeater/Hotspot Configuration
 
+> HBlink4 speaks the HomeBrew Protocol directly. These instructions target `MMDVMHost` and `DMRGateway` — the two stacks that send and parse this protocol natively. GUI wrappers built on top of them are out of scope.
+
 ### Basic Setup Steps
 
-1. **Set connection mode to "Homebrew" or "HBlink"** in your software
+1. **Set the network type to "Homebrew" or "HBlink"** in `MMDVM.ini` or `DMRGateway.ini`
 2. **Enter server details**:
-   - Server IP address or hostname
-   - Port (usually 62031 for IPv4 or 62032 for IPv6)
+   - `Address=` — server IP address or hostname
+   - `Port=` — usually 62031 for IPv4 or 62032 for IPv6
 3. **Enter your credentials**:
    - Your DMR radio ID
-   - Passkey (provided by server administrator)
+   - Password / passkey (provided by server administrator)
    - Callsign
    - Location
-4. **Configure talkgroups** (if your software supports it)
-5. **Save and restart** your repeater/hotspot software
-
-
-```
+4. **Configure talkgroups** via `Options=` (see [Dynamic Talkgroup Selection](#dynamic-talkgroup-selection))
+5. **Save and restart** `MMDVMHost` / `DMRGateway`
 
 **Contact your server administrator** to have your repeater added to their configuration.
 
@@ -45,7 +44,9 @@ Most firewalls handle this automatically, but if you experience frequent disconn
 
 ## Dynamic Talkgroup Selection
 
-Some repeater software (like Pi-Star, WPSD) allows you to configure which talkgroups you want to use. This is called **dynamic talkgroup subscription**.
+MMDVMHost and DMRGateway let you declare which talkgroups you want on each timeslot via an `Options=` line in the network configuration. This is called **dynamic talkgroup subscription** and is delivered to HBlink4 as the RPTO packet after login.
+
+> This guide covers the syntax that goes directly into `MMDVMHost` / `DMRGateway` configuration. GUI wrappers that sit on top of those stacks are out of scope — consult their own documentation for where to enter the string.
 
 ### How It Works
 
@@ -53,11 +54,9 @@ Some repeater software (like Pi-Star, WPSD) allows you to configure which talkgr
 - The server will only accept talkgroups that **both** you request **and** the server allows
 - You can change your talkgroup selection without disconnecting
 
-### Configuration Examples
+### Configuration
 
-**For MMDVM.ini or DMRGateway.ini:**
-
-Add the `Options=` line to your HBlink/Homebrew server configuration section:
+Add the `Options=` line to your HBlink/Homebrew server section in `MMDVM.ini` or `DMRGateway.ini`:
 
 ```ini
 [DMR Network 1]
@@ -74,24 +73,16 @@ Options=TS1=1,2,3;TS2=10,20,30
 - To disable a timeslot, leave it empty: `Options=TS1=;TS2=10,20`
 - To use all allowed talkgroups, omit the `Options=` line entirely
 
-**Pi-Star/WPSD:**
-
-These platforms typically have a GUI field for talkgroups. Enter them in the same format:
-```
-TS1=1,2,3;TS2=10,20,30
-```
-
-### Examples
-
 ### Examples
 
 **Example 1: Select a Subset of Talkgroups**
 
 Server allows: TGs 1, 2, 3, 4, 5, 91, 310 on TS1 and TGs 10, 20, 30, 40, 50 on TS2
 
-You configure in your repeater software:
-- TS1: TGs 1, 2, 3
-- TS2: TGs 10, 20
+You configure in `MMDVM.ini` / `DMRGateway.ini`:
+```ini
+Options=TS1=1,2,3;TS2=10,20
+```
 
 Result: You'll receive traffic for those specific talkgroups only.
 
@@ -99,13 +90,13 @@ Result: You'll receive traffic for those specific talkgroups only.
 
 Server allows: TGs 1, 2, 3 on TS1
 
-You configure: TGs 1, 2, 3, 91 on TS1
+You configure: `Options=TS1=1,2,3,91`
 
 Result: You'll only get TGs 1, 2, 3 (TG 91 is rejected because it's not in the server's allowed list)
 
 **Example 3: Use All Talkgroups**
 
-Simply don't configure specific talkgroups in your software - you'll automatically get all talkgroups the server allows for your repeater.
+Omit the `Options=` line entirely — you'll automatically get every talkgroup the server allows for your repeater.
 
 **Example 4: Disable a Timeslot**
 
@@ -125,6 +116,62 @@ Result: No traffic on TS1, only TS2 talkgroups active.
 
 **Don't configure it when:**
 - You want all allowed talkgroups (it will happen automatically)
+
+## Advanced: Slot / Talkgroup Translation and rf_src Override
+
+> **Trusted repeaters only.** These extensions are honored only when the HBlink4 administrator has set `"trust": true` for your repeater. Non-trusted repeaters have the extra syntax silently ignored (the basic subscription still works).
+
+The `Options=` string in `MMDVM.ini` / `DMRGateway.ini` accepts extended syntax that lets HBlink4 translate between **your local addressing** and the **network's addressing** — so your users can talk on local slot/tgid combinations that differ from what the wider network uses, without renumbering either side.
+
+### Extended `Options=` grammar
+
+In addition to the basic `TS1=tgids;TS2=tgids` form, each comma-separated entry may carry a translation clause:
+
+```
+TS1 = entry[,entry...]
+TS2 = entry[,entry...]
+SRC = radio_id
+
+entry          = net_tgid[:local_slot[:local_tgid]]
+net_tgid       = N  |  N-M   (range, inclusive)
+local_slot     = 1 | 2 | *    (* = same as network slot)
+local_tgid     = N | *        (* = same as matched network tgid)
+```
+
+- The `TS1=` / `TS2=` key always names the **network** slot.
+- Entries without a colon are plain subscriptions (same as today).
+- `SRC=` rewrites the rf_src on every outgoing group-voice packet from this repeater — useful for presenting a single "site radio" to the rest of the network.
+
+### Quick examples (drop straight into `Options=`)
+
+```ini
+; Subscribe to network TG9 on TS1 (legacy, unchanged)
+Options=TS1=9
+
+; Swap slots: deliver network TS1/TG9 on your local TS2/TG9
+Options=TS1=9:2:9
+
+; Renumber: network TS1/TG9 is heard locally as TS1/TG32
+Options=TS1=9:*:32
+
+; Bring a whole range onto your TS2, preserving tgids
+Options=TS1=3000-3200:2:*
+
+; Range with an exception — TG3120 stays on TS1, rest go to TS2
+Options=TS1=3000-3200:2:*,3120:1:3120
+
+; Outbound rf_src override — everything you transmit appears to come from ID 9990001
+Options=TS1=*;TS2=*;SRC=9990001
+```
+
+### Rules to keep in mind
+
+- **Ranges** are expanded up to 10,000 tgids; larger ranges are rejected at parse time.
+- **No wildcards on the network side** — use a specific TGID or a range. `*` as the network tgid or prefixes like `9*` are rejected.
+- **Most-specific wins.** An exact TG in a range overrides the range for that TG (see TG3120 example above). The server logs a warning for any conflicting less-specific rule it drops.
+- **`SRC=` applies only to group voice.** It's one-way — there is no reverse mapping, because group destinations don't carry return-address semantics.
+
+For the full semantics (Link Control rewriting, collision handling, mid-stream RPTO behavior, operational notes) see **[dmrd_translation.md](dmrd_translation.md)**.
 
 ## Troubleshooting
 
@@ -163,12 +210,10 @@ Result: No traffic on TS1, only TS2 talkgroups active.
 
 **Problem**: Configured specific talkgroups but still getting all traffic (or no traffic)
 
-**Problem**: Configured specific talkgroups but still getting all traffic (or no traffic)
-
 **Solutions**:
-- Verify your software supports dynamic talkgroup selection
+- Verify the `Options=` line is present and correctly formatted in `MMDVM.ini` / `DMRGateway.ini`
 - Check that the talkgroups you configured are allowed by the server
-- Try not configuring specific talkgroups to use all available
+- Try removing the `Options=` line entirely to get all available talkgroups
 - Contact the server administrator to verify which talkgroups are allowed for your repeater
 
 ### Frequent Disconnections
@@ -186,10 +231,9 @@ Result: No traffic on TS1, only TS2 talkgroups active.
 
 If you need assistance:
 
-1. **Check your repeater/hotspot software logs** for error messages
+1. **Check your MMDVMHost / DMRGateway logs** for error messages
 2. **Contact your server administrator** - they can see detailed connection logs
-3. **Check Pi-Star/WPSD forums** if using those platforms
-4. **Review HBlink4 documentation**: https://github.com/n0mjs710/HBlink4
+3. **Review HBlink4 documentation**: https://github.com/n0mjs710/HBlink4
 
 ## Quick Reference
 
