@@ -94,6 +94,7 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[Logging](docs/logging.md)** - Log management and rotation
 - **[Roadmap / TODO](docs/TODO.md)** - Planned work (unit calls, performance monitoring, config UI)
 - **[OpenBridge Analysis](docs/OPENBRIDGE_ANALYSIS.md)** - Reference analysis for future OpenBridge support
+- **[Release Notes v4.7.0](docs/RELEASE_NOTES_v4.7.0.md)** - Current release — asyncio, DMRA, outbound connections, DMRD translation
 
 
 
