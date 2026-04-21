@@ -69,7 +69,7 @@ Rules:
 
 ## How it works
 
-A DMRD packet carries `(rf_src, dst_id, slot, rf_src, payload)` in its 20-byte HBP header plus a 33-byte DMR payload. Translation rewrites only the header — the payload is either left alone (voice frames) or zeroed (data-sync frames, see below).
+A DMRD packet carries `(rf_src, dst_id, slot, rf_src, payload)` in its 20-byte HBP header plus a 33-byte DMR payload. Translation rewrites the header **and** re-encodes the DMR Link Control embedded in the payload so on-air addressing matches the rewritten header (see [Link Control rewriting](#link-control-rewriting) below).
 
 Each trusted repeater that declared translation rules gets two lookup tables (built from its RPTO):
 
@@ -129,13 +129,31 @@ Inbound rejected: repeater=3100001 keyed net-side TS2/TG3120 for a translated TG
 
 If the repeater legitimately wants the same `(slot, tgid)` pair on both sides (identity map), declare it explicitly — e.g., `TS1=3000-3200:2:*,3120:1:3120` keeps TG3120 on TS1 for both sides while mapping the rest of the range to TS2. Identity-mapped entries land in both `inbound_map` and `outbound_map` and are translated (to themselves) rather than rejected.
 
-### Payload blanking
+### Link Control rewriting
 
-DMR packets with `frame_type == 2` carry data-sync overhead: LC (link control) headers, terminators, and CSBKs. MMDVMHost reconstructs sync patterns, EMB, slot type, and LC overhead from the DMRD header *unless* its BPTC decode of the payload succeeds, in which case the decoded LC values override the header.
+DMR Link Control (LC) carries the on-air addressing that MMDVMHost and subscriber radios see — the call type (group/private), destination talkgroup, and source subscriber ID. LC lives in two places in the 33-byte payload:
 
-For any packet HBlink4 rewrites (translated repeater target, or whenever the source declared translation), data-sync frames have **bytes 20–52 zeroed** on the way out. That forces MMDVMHost's BPTC decode to fail, causing it to fall back to the DMRD header values we just rewrote. Voice frames (`frame_type` 0 or 1) are left intact — the AMBE vocoder bits live in the payload and MMDVMHost regenerates the voice-frame overhead from scratch.
+- **Full LC** (196 BPTC-encoded bits) in Voice Header (VHEAD) and Voice Terminator (VTERM) data-sync frames.
+- **Embedded LC** (32 bits per burst) in voice bursts B, C, D, and E. A radio reassembles the four fragments across one voice superframe (~360 ms) into the same 9-byte LC.
 
-This is the mechanism that makes translation work over-the-air. The server never decodes or re-encodes DMR — it just rewrites header fields and lets MMDVMHost rebuild the rest.
+When HBlink4 translates — meaning any forwarded packet gets its `(slot, dst_id, rf_src)` rewritten — it must also re-encode the LC so the payload matches the new header. If it didn't, MMDVMHost would accumulate EMB_LC fragments carrying the *original* source addressing and start contradicting the header after roughly one voice superframe, wedging the decode state machine on every downstream repeater.
+
+For each unique target addressing in a stream, HBlink4 caches three encoded forms computed by `dmr_utils3.bptc`:
+
+- the 196-bit BPTC codeword for VHEAD
+- the 196-bit BPTC codeword for VTERM
+- the four 32-bit EMB_LC fragments, keyed by burst number (1..4)
+
+On each outbound packet:
+
+- VHEAD (`frame_type=2, dtype_vseq=1`) → splice the VHEAD codeword over payload bits `[0:98]` and `[166:264]`, preserving the 68-bit slot-type/sync window at `[98:166]`.
+- VTERM (`frame_type=2, dtype_vseq=2`) → same splice pattern with the VTERM codeword.
+- Voice burst B/C/D/E (voice frame, `dtype_vseq ∈ {1,2,3,4}`) → splice the EMB_LC fragment over payload bits `[116:148]`. AMBE vocoder bits at `[0:116]` and `[148:264]` are untouched, so audio is bit-identical.
+- Any other frame (burst A, CSBK, data headers) → payload passes through unchanged.
+
+The source LC is snapshotted once per stream. If a VHEAD is seen early, it's decoded so FLCO / FID / service-options bits survive the re-encode; otherwise HBlink4 synthesizes a default group-voice LC from `(opts=0x000020, dst_id, rf_src)`. Cost is one BPTC encode per unique outbound `(dst, src)` tuple per stream — typically ≤ 2 encodes for the full duration of a call, regardless of packet rate.
+
+Untranslated forwards (no address change for a given target) skip the splice entirely and use a zero-copy fast path.
 
 ---
 

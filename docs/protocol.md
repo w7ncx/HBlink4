@@ -118,8 +118,8 @@ A server will, at a minimum, need to track a repeater in the following states:
 
    Wildcards are **not** permitted on the net-side (no `*`, no `N*` prefix).
    Most-specific rule wins on collision (exact=3 > range=2). See
-   [dmrd_translation.md](dmrd_translation.md) for semantics, payload-blanking
-   behavior, and use cases, and [connecting_to_hblink4.md](connecting_to_hblink4.md)
+   [dmrd_translation.md](dmrd_translation.md) for semantics, Link Control
+   rewriting behavior, and use cases, and [connecting_to_hblink4.md](connecting_to_hblink4.md)
    for operator-facing `Options=` examples.
 
 6. **RPTCL (Repeater Close)**
@@ -188,13 +188,15 @@ A server will, at a minimum, need to track a repeater in the following states:
 
    **_bits Field (byte 15):**
    - Bit 7: Timeslot (0=Slot 1, 1=Slot 2)
-   - Bit 6: Call Type (0=Private, 1=Group)
+   - Bit 6: Call Type (0=Group, 1=Private/Unit)
    - Bits 4-5: Frame Type
      - `00` - Voice frame
      - `01` - Voice Sync (header/terminator)
      - `10` - Data Sync (header/terminator)
      - `11` - Unused
-   - Bits 0-3: Reserved
+   - Bits 0-3: Data Type / Voice Sequence (dtype_vseq)
+     - For Data Sync frames: `0x1`=VHEAD (voice header with full LC), `0x2`=VTERM (voice terminator with full LC), `0x3`=CSBK, other values=data headers
+     - For Voice / Voice Sync frames: `0x0`=burst A, `0x1`..`0x4`=bursts B..E (each carrying a 32-bit EMB_LC fragment), `0x5`=burst F
 
    **DMR Stream Terminator Detection:**
    

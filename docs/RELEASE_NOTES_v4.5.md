@@ -1,4 +1,4 @@
-# HBlink4 Release v1.5 - Detailed Repeater Information
+# HBlink4 Release v4.5 - Detailed Repeater Information
 
 ## Release Date
 October 7, 2025
@@ -209,7 +209,7 @@ No configuration changes required. Feature works automatically with existing con
 
 ## Migration Notes
 
-### From v1.4 to v1.5
+### From v4.4 to v4.5
 - No database changes required
 - No configuration changes needed
 - Dashboard will receive new events automatically
@@ -223,7 +223,7 @@ No configuration changes required. Feature works automatically with existing con
 If issues arise:
 ```bash
 cd /home/cort/hblink4
-git checkout v1.4
+git checkout v4.4
 systemctl restart hblink4
 systemctl restart hblink4-dash
 ```
@@ -267,6 +267,6 @@ Implemented approach combines:
 
 ## Version Tags
 
-- **Previous**: v1.4 (Audio Notifications)
-- **Current**: v1.5 (Detailed Repeater Information)
+- **Previous**: v4.4 (Audio Notifications)
+- **Current**: v4.5 (Detailed Repeater Information)
 - **Next**: TBD

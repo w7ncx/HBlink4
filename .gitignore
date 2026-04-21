@@ -43,6 +43,10 @@ config/config.json
 config/config_bak.json
 dashboard/config.json
 
+# User database backups (script output / dashboard refresh artifacts)
+user.old*
+user.bak*
+
 # OS
 .DS_Store
 .DS_Store?

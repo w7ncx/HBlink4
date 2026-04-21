@@ -66,6 +66,12 @@ class StreamState:
     is_assumed: bool = False        # True if TX stream (forwarded TO repeater)
     target_repeaters: Optional[set] = None  # Cached set of repeater_ids for forwarding
     routing_cached: bool = False    # True once routing calculated
+    lc_base: Optional[bytes] = None # 9-byte Link Control captured at stream start
+                                    # (decoded from VHEAD if present, else synthesized)
+    lc_cache: Dict[Tuple[bytes, bytes], Any] = field(default_factory=dict)
+                                    # Per-target (out_dst, out_src) → encoded
+                                    # (h_lc, t_lc, emb_lc) for payload rewrite under
+                                    # translation. See docs/dmrd_translation.md.
 ```
 
 **Key Methods:**

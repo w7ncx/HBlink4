@@ -171,7 +171,7 @@ Options=TS1=*;TS2=*;SRC=9990001
 - **Most-specific wins.** An exact TG in a range overrides the range for that TG (see TG3120 example above). The server logs a warning for any conflicting less-specific rule it drops.
 - **`SRC=` applies only to group voice.** It's one-way — there is no reverse mapping, because group destinations don't carry return-address semantics.
 
-For the full semantics (payload blanking, collision handling, mid-stream RPTO behavior, operational notes) see **[dmrd_translation.md](dmrd_translation.md)**.
+For the full semantics (Link Control rewriting, collision handling, mid-stream RPTO behavior, operational notes) see **[dmrd_translation.md](dmrd_translation.md)**.
 
 ## Troubleshooting
 

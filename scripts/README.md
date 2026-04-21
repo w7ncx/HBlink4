@@ -4,6 +4,8 @@
 
 Filters the DMR user database to only include US and Canada entries, reducing file size and memory usage.
 
+> **Note**: The dashboard now refreshes `user.csv` automatically on a daily schedule via [dashboard/user_db.py](../dashboard/user_db.py), applying configurable country/callsign/ID filters without a restart. This script remains available for manual / one-off filtering when the automated pipeline isn't in use.
+
 ### Usage
 
 #### Download latest user database:

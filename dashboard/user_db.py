@@ -17,8 +17,6 @@ Data contract:
       {"1234567": "WX1YZ", "1234568": "VA3ABC", ...}
     - Sidecar metadata: {last_modified_header, row_count, refresh_timestamp,
       source_url, source_status}
-
-See docs/user_csv_automation_proposal.md for the full rationale.
 """
 from __future__ import annotations
 
