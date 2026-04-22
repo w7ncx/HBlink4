@@ -1642,22 +1642,26 @@
                 // Server stream state ends ~200ms after a single burst; the
                 // 3s persistence-of-vision hold is enforced client-side via
                 // DATA_PERSIST_MS in the stream_start handler.
-                if (stream.call_type === 'data') {
+                if (stream.is_data) {
                     status = 'data';
                     statusLabel = 'DATA';
                 }
             }
-            
+
+            // Compose a human Type label from the two wire dimensions:
+            //   call_type  ('group' | 'private')      — addressing
+            //   is_data    (bool, payload kind)       — voice vs data
+            function formatCallType(s) {
+                if (!s) return '—';
+                const addr = s.call_type === 'private' ? 'Private' : 'Group';
+                const kind = s.is_data ? 'Data' : 'Voice';
+                return `${addr} ${kind}`;
+            }
+
             // Special rendering for hang time: show only TG and call type
             if (status === 'hang_time') {
-                const callTypeMap = {
-                    'group': 'Group Voice',
-                    'private': 'Private Voice',
-                    'data': 'Data',
-                    'unknown': 'Unknown'
-                };
                 const destination = stream?.dst_id || '—';
-                const callType = stream ? (callTypeMap[stream.call_type] || stream.call_type || 'Unknown') : '—';
+                const callType = formatCallType(stream);
                 
                 return `
                     <div class="slot ${status}">
@@ -1689,18 +1693,10 @@
                 `;
             }
             
-            // Format call type
-            const callTypeMap = {
-                'group': 'Group Voice',
-                'private': 'Private Voice',
-                'data': 'Data',
-                'unknown': 'Unknown'
-            };
-            
             // Prepare field values
             const source = stream?.src_id || '—';
             const destination = stream?.dst_id || '—';
-            const callType = stream ? (callTypeMap[stream.call_type] || stream.call_type || 'Unknown') : '—';
+            const callType = formatCallType(stream);
             
             // Calculate real-time duration for active streams
             let duration = '—';
@@ -2052,7 +2048,7 @@
                 // 📟 (pager) carries the strongest semantic tie to what DMR
                 // data actually is — short text/GPS bursts over radio.
                 const isUnit = user.call_type === 'private';
-                const isData = user.call_type === 'data';
+                const isData = !!user.is_data;
                 const addrEmoji = isUnit
                     ? '<span title="Unit (private) call">👤</span>'
                     : '<span title="Group call">👥</span>';
@@ -2123,7 +2119,7 @@
                         const persistConnId = connection_type === 'outbound'
                             ? data.connection_name : data.repeater_id;
                         const persistKey = dataPersistKey(connection_type, persistConnId, data.slot);
-                        if (data.call_type === 'data') {
+                        if (data.is_data) {
                             scheduleDataPersistDrop(persistKey, connection_type, (s) => {
                                 if (connection_type === 'outbound') {
                                     return s.connection_type === 'outbound'
@@ -2166,7 +2162,7 @@
                         // mid-persistence hang_time flip would just cause a
                         // hang-time rendering to flash before the timer drops
                         // the stream. Let the timer handle removal.
-                        if (existingStream.call_type !== 'data') {
+                        if (!existingStream.is_data) {
                             existingStream.status = 'hang_time';
                             existingStream.hang_time = data.hang_time !== undefined ? data.hang_time : 0;
                             const packetCount = (data.packet_count !== undefined) ? data.packet_count :

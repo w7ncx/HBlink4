@@ -723,9 +723,11 @@ class HBProtocol(asyncio.DatagramProtocol):
                 cache_outbound_name=conn_name,
             )
             outbound_state.set_slot_stream(_slot, new_stream)
+            emit_call_type = 'private' if _call_type == 1 else 'group'
             self._emit_stream_start(
                 'outbound', conn_name, _slot, _rf_src, _dst_id, _stream_id,
-                'data', False, remote_repeater_id,
+                emit_call_type, False, remote_repeater_id,
+                is_data=True,
             )
             return
 
@@ -1262,31 +1264,37 @@ class HBProtocol(asyncio.DatagramProtocol):
     # Stream Helper Functions  
     # ================================
     
-    def _emit_stream_start(self, connection_type: str, connection_id: str, 
+    def _emit_stream_start(self, connection_type: str, connection_id: str,
                           slot: int, src_id: bytes, dst_id: bytes, stream_id: bytes,
                           call_type: str, is_assumed: bool = False,
-                          remote_repeater_id: int = None) -> None:
+                          remote_repeater_id: int = None,
+                          is_data: bool = False) -> None:
         """
         Stream_start event emission for all connection types.
-        
+
         Args:
             connection_type: 'repeater' or 'outbound'
-            connection_id: repeater_id (int) or connection_name (str) 
+            connection_id: repeater_id (int) or connection_name (str)
             slot: Slot number
             src_id: Source DMR ID (bytes)
-            dst_id: Destination ID (bytes)  
+            dst_id: Destination ID (bytes)
             stream_id: Stream ID (bytes)
-            call_type: Call type string
+            call_type: Call type string — addressing dimension only ('group'
+                or 'private'). Payload kind (voice vs data) lives in is_data.
             is_assumed: Whether this is an assumed (TX) stream
             remote_repeater_id: For outbound connections, the originating repeater ID
+            is_data: True for data calls (APRS/SMS/CSBK/etc.). Kept orthogonal
+                to call_type so dashboards can render both dimensions (group
+                vs unit AND voice vs data) without encoding them in one string.
         """
         event_data = {
             'slot': slot,
             'src_id': int.from_bytes(src_id, 'big'),
-            'dst_id': int.from_bytes(dst_id, 'big'), 
+            'dst_id': int.from_bytes(dst_id, 'big'),
             'stream_id': stream_id.hex(),
             'call_type': call_type,
-            'is_assumed': is_assumed
+            'is_assumed': is_assumed,
+            'is_data': is_data,
         }
         
         if connection_type == 'repeater':
@@ -1313,7 +1321,18 @@ class HBProtocol(asyncio.DatagramProtocol):
         """
         duration = time() - stream.start_time
         hang_time = CONFIG.get('global', {}).get('stream_hang_time', 10.0)
-        
+
+        # Split the StreamState.call_type (server-internal, uses 'data' as a
+        # flag value) back into the wire-format dimensions the dashboard
+        # expects: call_type='group'|'private' for addressing, is_data for
+        # payload kind. is_unit_call on the state tells us the addressing.
+        if stream.call_type == 'data':
+            emit_call_type = 'private' if stream.is_unit_call else 'group'
+            emit_is_data = True
+        else:
+            emit_call_type = stream.call_type
+            emit_is_data = False
+
         event_data = {
             'slot': slot,
             'src_id': int.from_bytes(stream.rf_src, 'big'),
@@ -1323,8 +1342,9 @@ class HBProtocol(asyncio.DatagramProtocol):
             'packet_count': stream.packet_count,
             'end_reason': end_reason,
             'hang_time': hang_time,
-            'call_type': stream.call_type,
-            'is_assumed': stream.is_assumed
+            'call_type': emit_call_type,
+            'is_assumed': stream.is_assumed,
+            'is_data': emit_is_data,
         }
         
         if connection_type == 'repeater':
@@ -1946,9 +1966,10 @@ class HBProtocol(asyncio.DatagramProtocol):
                 cache_outbound_name=None,
             )
             repeater.set_slot_stream(slot, new_stream)
+            emit_call_type = 'private' if call_type_bit == 1 else 'group'
             self._emit_stream_start(
                 'repeater', rid_int, slot, rf_src, dst_id, stream_id,
-                'data', False,
+                emit_call_type, False, is_data=True,
             )
             return True
 
