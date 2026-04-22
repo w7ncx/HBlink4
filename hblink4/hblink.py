@@ -59,6 +59,8 @@ try:
         LC_CARRIER_VTERM, LC_CARRIER_EMB, build_lc, synth_lc_base,
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
+        STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
+        dtype_name, decode_data_header,
     )
 except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -88,6 +90,8 @@ except ImportError:
         LC_CARRIER_VTERM, LC_CARRIER_EMB, build_lc, synth_lc_base,
         decode_lc_from_vhead, encode_lc_forms, splice_full_lc, splice_emb_lc,
         classify_lc_carrier,
+        STREAM_KIND_DATA, STREAM_KIND_VOICE, classify_stream_kind,
+        dtype_name, decode_data_header,
     )
 
 # Data classes moved to models.py
@@ -147,6 +151,14 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Track denied streams to avoid repeated logging
         # Key: (repeater_id, slot, stream_id), Value: timestamp of first denial
         self._denied_streams: Dict[tuple, float] = {}
+
+        # Data-call log dedupe: one APRS beacon arrives as several DMR data
+        # bursts (each its own HBP stream_id) within a few hundred ms. Coalesce
+        # log output by (source, rf_src, dst_id, slot) so a single beacon =
+        # one log line, not four.
+        # Key: (source_key, rf_src, dst_id, slot), Value: timestamp of last log
+        self._data_log_recent: Dict[tuple, float] = {}
+        self._data_log_dedupe_window = 2.0
         
         # Initialize user cache (mandatory for proper operation)
         user_cache_config = CONFIG.get('global', {}).get('user_cache', {})
@@ -689,6 +701,33 @@ class HBProtocol(asyncio.DatagramProtocol):
         src_id = packet['src_id_int']
         remote_repeater_id = packet['repeater_id_int']
         _is_terminator = self._is_dmr_terminator(data, _frame_type)
+        _dtype_vseq = data[15] & 0x0F
+        _payload = data[20:53] if len(data) >= 53 else b''
+
+        # Data calls (APRS, SMS, CSBK, etc.) are logged but never forwarded —
+        # check before the unit-call dispatch so group and unit data both
+        # land in the same drop path. Subsequent bursts in a multi-burst
+        # data call re-install fresh StreamState but dedupe is applied in
+        # _handle_data_stream so log output stays quiet.
+        if classify_stream_kind(_frame_type, _dtype_vseq) == STREAM_KIND_DATA:
+            conn_name = outbound_state.config.name
+            dummy_id = outbound_state.config.radio_id.to_bytes(4, 'big')
+            new_stream = self._handle_data_stream(
+                source_key=f'outbound {conn_name}',
+                owner_id=dummy_id,
+                rf_src=_rf_src, dst_id=_dst_id, slot=_slot,
+                stream_id=_stream_id, call_type_bit=_call_type,
+                frame_type=_frame_type, dtype_vseq=_dtype_vseq,
+                payload=_payload,
+                cache_repeater_id=remote_repeater_id,
+                cache_outbound_name=conn_name,
+            )
+            outbound_state.set_slot_stream(_slot, new_stream)
+            self._emit_stream_start(
+                'outbound', conn_name, _slot, _rf_src, _dst_id, _stream_id,
+                'data', False, remote_repeater_id,
+            )
+            return
 
         # Unit (private) calls from an outbound link take a dedicated path:
         # no TG ACL, no translation, RPF-style anti-loop (do not re-forward
@@ -1182,7 +1221,10 @@ class HBProtocol(asyncio.DatagramProtocol):
         rid_int = rid_to_int(repeater_id)
         src_int = int.from_bytes(stream.rf_src, "big")
         dst_int = int.from_bytes(stream.dst_id, "big")
-        log = LOGGER.debug if stream_type == "TX" else LOGGER.info
+        # Data streams already logged once at dedupe time by _handle_data_stream;
+        # quiet their end line so a busy APRS channel doesn't echo through here.
+        log = (LOGGER.debug if stream_type == "TX" or stream.call_type == "data"
+               else LOGGER.info)
 
         if stream.is_unit_call:
             call_type_prefix = "Unit"
@@ -1448,6 +1490,12 @@ class HBProtocol(asyncio.DatagramProtocol):
         # Cleanup old denied stream entries (older than 10 seconds)
         denied_cutoff = current_time - 10.0
         self._denied_streams = {k: v for k, v in self._denied_streams.items() if v > denied_cutoff}
+
+        # Cleanup stale data-call log-dedupe entries
+        data_log_cutoff = current_time - (self._data_log_dedupe_window * 2)
+        self._data_log_recent = {
+            k: v for k, v in self._data_log_recent.items() if v > data_log_cutoff
+        }
     
     def _cleanup_user_cache(self):
         """Periodic cleanup of expired user cache entries"""
@@ -1779,12 +1827,131 @@ class HBProtocol(asyncio.DatagramProtocol):
             
         return repeater
     
-    def _handle_stream_start(self, repeater: RepeaterState, rf_src: bytes, dst_id: bytes, 
-                             slot: int, stream_id: bytes, call_type_bit: int = 1) -> bool:
+    def _handle_data_stream(self, source_key: str, owner_id: bytes,
+                            rf_src: bytes, dst_id: bytes, slot: int,
+                            stream_id: bytes, call_type_bit: int,
+                            frame_type: int, dtype_vseq: int,
+                            payload: bytes,
+                            cache_repeater_id: int = 0,
+                            cache_outbound_name: Optional[str] = None) -> StreamState:
+        """
+        Track a data call: log it, optionally decode the data header, emit a
+        dashboard event — but DO NOT forward. Same path for group and unit
+        data; the only forwarding-relevant distinction is that `dst_id` is
+        a TGID for group data and a target RID for unit data.
+
+        Returns a StreamState marked with call_type="data". Caller must
+        install it on the owning repeater/outbound slot so subsequent
+        bursts land on the same state instead of churning through
+        fast-terminator + contention logic.
+
+        Log output is deduped per (source_key, rf_src, dst_id, slot) inside
+        _data_log_dedupe_window seconds so a multi-burst APRS beacon emits
+        one log line, not four.
+        """
+        current_time = time()
+        src_int = bytes_to_int(rf_src)
+        dst_int = bytes_to_int(dst_id)
+        is_group = (call_type_bit == 0)
+
+        dedupe_key = (source_key, rf_src, dst_id, slot)
+        last_seen = self._data_log_recent.get(dedupe_key)
+        emit_log = (last_seen is None
+                    or (current_time - last_seen) > self._data_log_dedupe_window)
+
+        kind_tag = 'Group' if is_group else 'Unit'
+        dst_label = 'TGID' if is_group else 'RID'
+
+        # Always attempt Tier-2 decode on Data Header frames so operators see
+        # the DPF / SAP in the log. CSBK / rate-½/rate-¾ / rate-1 bursts carry
+        # transport payload we can't decode without protocol context, so we
+        # just tag them with the frame type name and move on.
+        decoded = None
+        if frame_type == 2 and dtype_vseq == 6 and len(payload) >= 33:
+            decoded = decode_data_header(payload[:33])
+
+        if emit_log:
+            self._data_log_recent[dedupe_key] = current_time
+            dname = dtype_name(dtype_vseq) if frame_type == 2 else f'voice-ft{frame_type}'
+            parts = [
+                f'{kind_tag} data call on {source_key} TS/{dst_label}: {slot}/{dst_int}',
+                f'src={src_int}',
+                f'dtype={dname}',
+                f'stream_id={stream_id.hex()}',
+            ]
+            if decoded is not None:
+                parts.append(f'dpf={decoded["dpf_name"]}')
+                parts.append(f'sap={decoded["sap_name"]}')
+                parts.append(f'blocks={decoded["blocks_to_follow"]}')
+                parts.append(f'raw={decoded["raw"].hex()}')
+            else:
+                parts.append(f'payload={payload[:16].hex()}')
+            parts.append('[not forwarded]')
+            LOGGER.info(' '.join(parts))
+
+        new_stream = StreamState(
+            repeater_id=owner_id,
+            rf_src=rf_src,
+            dst_id=dst_id,
+            slot=slot,
+            start_time=current_time,
+            last_seen=current_time,
+            stream_id=stream_id,
+            packet_count=1,
+            call_type="data",
+            is_unit_call=(not is_group),
+            # Data calls do not fan out, so nothing to cache.
+            target_repeaters=set(),
+            routing_cached=True,
+        )
+
+        # Populate the user cache — data calls are as good a locator as
+        # voice. If a radio beacons APRS from repeater X now, a unit voice
+        # call placed to that radio ten minutes later routes to X instead
+        # of broadcasting.
+        if self._user_cache:
+            self._user_cache.update(
+                radio_id=src_int,
+                repeater_id=cache_repeater_id,
+                callsign='',
+                slot=slot,
+                talkgroup=dst_int,
+                outbound_name=cache_outbound_name,
+            )
+
+        return new_stream
+
+    def _handle_stream_start(self, repeater: RepeaterState, rf_src: bytes, dst_id: bytes,
+                             slot: int, stream_id: bytes, call_type_bit: int = 1,
+                             frame_type: int = 0, dtype_vseq: int = 0,
+                             payload: bytes = b'') -> bool:
         """
         Handle the start of a new stream on a repeater slot.
         Returns True if the stream can proceed, False if there's a contention.
         """
+        # Voice-vs-data branch: the HBP call_type bit is only group-vs-unit,
+        # so check the payload frame_type/dtype_vseq to tell data bursts
+        # (APRS, SMS, GPS, CSBK) from real voice. Data calls are logged but
+        # never forwarded.
+        if classify_stream_kind(frame_type, dtype_vseq) == STREAM_KIND_DATA:
+            rid_int = rid_to_int(repeater.repeater_id)
+            new_stream = self._handle_data_stream(
+                source_key=f'repeater {rid_int}',
+                owner_id=repeater.repeater_id,
+                rf_src=rf_src, dst_id=dst_id, slot=slot,
+                stream_id=stream_id, call_type_bit=call_type_bit,
+                frame_type=frame_type, dtype_vseq=dtype_vseq,
+                payload=payload,
+                cache_repeater_id=rid_int,
+                cache_outbound_name=None,
+            )
+            repeater.set_slot_stream(slot, new_stream)
+            self._emit_stream_start(
+                'repeater', rid_int, slot, rf_src, dst_id, stream_id,
+                'data', False,
+            )
+            return True
+
         # Unit (private) calls take a dedicated path: separate routing (user
         # cache lookup with broadcast fallback), subscriber-pair hang-time
         # semantics, no TG access control, no DMRD translation.
@@ -2280,17 +2447,20 @@ class HBProtocol(asyncio.DatagramProtocol):
         return True
 
     def _handle_stream_packet(self, repeater: RepeaterState, rf_src: bytes, dst_id: bytes,
-                              slot: int, stream_id: bytes, call_type_bit: int = 1) -> bool:
+                              slot: int, stream_id: bytes, call_type_bit: int = 1,
+                              frame_type: int = 0, dtype_vseq: int = 0,
+                              payload: bytes = b'') -> bool:
         """
         Handle a packet for an ongoing stream.
         Returns True if the packet is valid for the current stream, False otherwise.
         """
         current_stream = repeater.get_slot_stream(slot)
-        
+
         if not current_stream:
             # No active stream - this is a new stream
-            return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id, call_type_bit)
-        
+            return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id,
+                                             call_type_bit, frame_type, dtype_vseq, payload)
+
         # Check if this packet belongs to the current stream
         if current_stream.stream_id != stream_id:
             # Different stream - potential contention
@@ -2298,26 +2468,35 @@ class HBProtocol(asyncio.DatagramProtocol):
             # This provides fast terminator detection when operators key up quickly
             current_time = time()
             time_since_last_packet = current_time - current_stream.last_seen
-            
+
             # Only use fast terminator for active streams that never got a proper terminator
             # If stream is already ended (in hang time), skip to hang time check
             if not current_stream.ended and time_since_last_packet > 0.2:  # 200ms threshold
                 # Old stream appears terminated - use unified ending logic
-                # Log the fast terminator detection first
-                LOGGER.info(f'Fast terminator: stream on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot} '
+                # Log the fast terminator detection first. Data streams are
+                # expected to be single-burst so quiet their fast-terminator
+                # log noise down to DEBUG.
+                log_fn = LOGGER.debug if current_stream.call_type == 'data' else LOGGER.info
+                log_fn(f'Fast terminator: stream on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot} '
                            f'ended via inactivity ({time_since_last_packet*1000:.0f}ms since last packet): '
                            f'src={int.from_bytes(current_stream.rf_src, "big")}, '
                            f'dst={int.from_bytes(current_stream.dst_id, "big")}, '
                            f'duration={(current_time - current_stream.start_time):.2f}s, packets={current_stream.packet_count}')
-                
+
                 # Now use unified ending logic
                 self._end_stream(current_stream, repeater.repeater_id, slot, current_time, 'fast_terminator')
-                
+
                 # Don't clear the stream - let _handle_stream_start check hang time
                 # It will create the new stream and replace this one if allowed
-                return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id, call_type_bit)
+                return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id,
+                                                 call_type_bit, frame_type, dtype_vseq, payload)
             elif not current_stream.ended:
-                # Real contention - stream still active (within 200ms)
+                # Real contention - stream still active (within 200ms).
+                # Data streams routinely arrive as back-to-back bursts with
+                # fresh stream_ids; suppress contention warning for those and
+                # silently accept (logged at stream-start dedupe window).
+                if current_stream.call_type == 'data':
+                    return False
                 LOGGER.warning(f'Stream contention on repeater {int.from_bytes(repeater.repeater_id, "big")} slot {slot}: '
                               f'existing stream (src={int.from_bytes(current_stream.rf_src, "big")}, '
                               f'dst={int.from_bytes(current_stream.dst_id, "big")}, '
@@ -2327,7 +2506,8 @@ class HBProtocol(asyncio.DatagramProtocol):
                 return False
             else:
                 # Stream already ended (in hang time) - let _handle_stream_start check hang time rules
-                return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id, call_type_bit)
+                return self._handle_stream_start(repeater, rf_src, dst_id, slot, stream_id,
+                                                 call_type_bit, frame_type, dtype_vseq, payload)
         
         # Update stream state
         current_stream.last_seen = time()
@@ -3414,23 +3594,35 @@ class HBProtocol(asyncio.DatagramProtocol):
         _call_type = packet['call_type']
         _frame_type = packet['frame_type']
         _stream_id = packet['stream_id']
-        
+        _dtype_vseq = data[15] & 0x0F
+        _payload = data[20:53] if len(data) >= 53 else b''
+
         # Check if this is a stream terminator (immediate end detection)
         # Note: _is_dmr_terminator() checks packet header flags for immediate detection
         _is_terminator = self._is_dmr_terminator(data, _frame_type)
-        
+
         # Handle stream tracking
-        stream_valid = self._handle_stream_packet(repeater, _rf_src, _dst_id, _slot, _stream_id, _call_type)
-        
+        stream_valid = self._handle_stream_packet(
+            repeater, _rf_src, _dst_id, _slot, _stream_id, _call_type,
+            _frame_type, _dtype_vseq, _payload,
+        )
+
         if not stream_valid:
             # Stream contention or not allowed - drop packet silently
             LOGGER.debug(f'Dropped packet from repeater {rid_to_int(repeater_id)} slot {_slot}: '
                         f'src={int.from_bytes(_rf_src, "big")}, dst={int.from_bytes(_dst_id, "big")}, '
                         f'reason=stream contention or talkgroup not allowed')
             return
-        
+
         # Get the current stream for this slot (after _handle_stream_packet has updated it)
         current_stream = repeater.get_slot_stream(_slot)
+
+        # Data streams are tracked (so fast-terminator/contention logic stays
+        # quiet) and emitted to the dashboard, but never forwarded. Drop here
+        # before the forwarding path and before stream_update telemetry —
+        # data calls don't produce meaningful packet-count telemetry anyway.
+        if current_stream and current_stream.call_type == 'data':
+            return
         
         # Per-packet logging - only enable for heavy troubleshooting
         #LOGGER.debug(f'DMR data from {packet["repeater_id_int"]} slot {_slot}: '
