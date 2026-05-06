@@ -4033,9 +4033,13 @@ def main():
     global LOGGER
     LOGGER = setup_logging(CONFIG, __name__)
     
+    # Deferred import — __version__ is bound on the package module after
+    # __init__.py finishes, which is after hblink.py finishes loading.
+    from hblink4 import __version__ as hblink4_version
+
     # Startup banner
     LOGGER.info('🚀 ═══════════════════════════════════════════════════════════════')
-    LOGGER.info('🚀 HBLINK4 STARTING UP')
+    LOGGER.info(f'🚀 HBLINK4 v{hblink4_version} STARTING UP')
     LOGGER.info('🚀 ═══════════════════════════════════════════════════════════════')
     
     asyncio.run(async_main())
