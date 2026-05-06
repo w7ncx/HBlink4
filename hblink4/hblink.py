@@ -2972,6 +2972,11 @@ class HBProtocol(asyncio.DatagramProtocol):
             # unit (private) call routing; absent = keep pattern default.
             requested_ts1: Set[bytes] = set()
             requested_ts2: Set[bytes] = set()
+            # An empty TS1= / TS2= must mean deny-all on that slot; without these
+            # flags it would be indistinguishable from "slot not mentioned" and
+            # would fall back to the configured defaults.
+            seen_ts1 = False
+            seen_ts2 = False
             translations: List[Tuple[int, bytes, int, bytes, int]] = []
             tx_src_override: Optional[bytes] = None
             unit_calls_override: Optional[bool] = None
@@ -2988,7 +2993,14 @@ class HBProtocol(asyncio.DatagramProtocol):
                 if key in ('TS1', 'TS2'):
                     net_slot = 1 if key == 'TS1' else 2
                     target_set = requested_ts1 if net_slot == 1 else requested_ts2
-                    if not value or value == '*':
+                    if value == '*':
+                        # Wildcard: leave as "not specified" so config fallback applies.
+                        continue
+                    if net_slot == 1:
+                        seen_ts1 = True
+                    else:
+                        seen_ts2 = True
+                    if not value:
                         continue
                     for entry in value.split(','):
                         entry = entry.strip()
@@ -3043,10 +3055,11 @@ class HBProtocol(asyncio.DatagramProtocol):
             
             # Check if this repeater is trusted
             if repeater_config.trust:
-                # Trusted repeater: use requested TGs as-is, config TGs become defaults
-                final_ts1 = requested_ts1 if requested_ts1 else (config_ts1 if config_ts1 else None)
-                final_ts2 = requested_ts2 if requested_ts2 else (config_ts2 if config_ts2 else None)
-                
+                # Trusted repeater: requested TGs are taken as-is; slots the
+                # repeater didn't mention fall back to the configured defaults.
+                final_ts1 = requested_ts1 if seen_ts1 else config_ts1
+                final_ts2 = requested_ts2 if seen_ts2 else config_ts2
+
                 # Log trust usage - show any TGs beyond config (informational, not warning)
                 if config_ts1 is not None and requested_ts1:
                     extra_ts1 = requested_ts1 - config_ts1
@@ -3058,31 +3071,34 @@ class HBProtocol(asyncio.DatagramProtocol):
                     if extra_ts2:
                         extra_ts2_ints = sorted(int.from_bytes(tg, 'big') for tg in extra_ts2)
                         LOGGER.info(f'🔓 Trusted repeater {rid_to_int(repeater_id)} using additional TS2 TGs: {extra_ts2_ints}')
-                
+
                 rejected_ts1 = set()
                 rejected_ts2 = set()
             else:
-                # Standard behavior: intersection of requested and config
-                # If config is None (allow all), any RPTO request is valid (subset of "all")
-                # If config is a set, only grant intersection (RPTO can restrict, not expand)
-                if config_ts1 is None:
-                    # Config allows all TGs, so grant whatever repeater requested
-                    final_ts1 = requested_ts1 if requested_ts1 else None  # None = keep "allow all"
+                # Standard behavior: intersection of requested and config.
+                # If a slot was not mentioned in RPTO, fall back to config; if it
+                # was mentioned (even as an empty list), honor the request and
+                # only intersect with config when config has explicit TGs.
+                if not seen_ts1:
+                    final_ts1 = config_ts1
+                elif config_ts1 is None:
+                    final_ts1 = requested_ts1
                 else:
-                    # Config has specific TGs, filter RPTO to only those in config
-                    final_ts1 = requested_ts1 & config_ts1 if requested_ts1 else config_ts1
-                
-                if config_ts2 is None:
-                    final_ts2 = requested_ts2 if requested_ts2 else None
+                    final_ts1 = requested_ts1 & config_ts1
+
+                if not seen_ts2:
+                    final_ts2 = config_ts2
+                elif config_ts2 is None:
+                    final_ts2 = requested_ts2
                 else:
-                    final_ts2 = requested_ts2 & config_ts2 if requested_ts2 else config_ts2
-            
+                    final_ts2 = requested_ts2 & config_ts2
+
                 # Log any requested TGs that were rejected (only when config has restrictions)
                 if config_ts1 is not None:
                     rejected_ts1 = requested_ts1 - config_ts1
                 else:
                     rejected_ts1 = set()  # No rejections when config allows all
-                
+
                 if config_ts2 is not None:
                     rejected_ts2 = requested_ts2 - config_ts2
                 else:
